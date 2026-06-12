@@ -609,6 +609,14 @@ private:
           sectionState.z1 = coeffs.b1 * y - coeffs.a1 * out + sectionState.z2;
           sectionState.z2 = coeffs.b2 * y - coeffs.a2 * out;
           y = out;
+
+          if (!std::isfinite(static_cast<double>(y)) || std::abs(static_cast<double>(y)) > 1.0e12)
+          {
+            for (size_t resetSection = 0; resetSection < mMinimumPhaseSections.size(); resetSection++)
+              state[chan * mMinimumPhaseSections.size() + resetSection] = {};
+            y = T(0.0);
+            break;
+          }
         }
         output[chan][s] = y;
       }
