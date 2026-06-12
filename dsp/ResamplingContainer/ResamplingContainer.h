@@ -165,7 +165,9 @@ public:
     const auto midSamples =
       mUseIntegerDownsampler ? static_cast<size_t>(mIntegerDownsampleFactor) : mResampler2->GetNumSamplesRequiredFor(1);
     mLatency = int(mResampler1->GetNumSamplesRequiredFor(midSamples));
-    if (mAntiAliasEnabled && mFilterPhase == EAntiAliasFilterPhase::LinearPhase)
+    if (mAntiAliasEnabled && mUseIntegerDownsampler && !mDecimationFirCoefficients.empty())
+      mLatency += 2 * GetDecimationFirLatency();
+    else if (mAntiAliasEnabled && mFilterPhase == EAntiAliasFilterPhase::LinearPhase)
       mLatency += 64;
     // 1. Push some silence through the first resampler.
     mResampler1->PushBlock(mScratchExternalInputPointers.GetList(), mLatency);
@@ -179,15 +181,11 @@ public:
     // a non-silent input is given to it.
     // Therefore, we don't *acutally* need to use `func()`--we can assume that it would output silence!
     // func(mEncapsulatedInputPointers.GetList(), mEncapsulatedOutputPointers.GetList(), (int)populated);
-    FallbackFunc(mEncapsulatedInputPointers.GetList(), mEncapsulatedOutputPointers.GetList(), (int)populated);
-    T** resamplerInput = mEncapsulatedOutputPointers.GetList();
-    if (mAntiAliasEnabled)
-    {
-      ApplyAntiAliasFilter(populated);
-      resamplerInput = mAntiAliasOutputPointers.GetList();
-    }
+    T** modelInput = PrepareModelInput(populated);
+    FallbackFunc(modelInput, mEncapsulatedOutputPointers.GetList(), (int)populated);
+    T** resamplerInput = PrepareDownsamplerInput(populated);
     if (mUseIntegerDownsampler)
-      DirectDecimateBlock(resamplerInput, populated, nullptr, 0);
+      DecimateBlock(resamplerInput, populated, nullptr, 0);
     else
       mResampler2->PushBlock(resamplerInput, populated);
     // Now we're ready for the first "real" buffer.
@@ -217,16 +215,12 @@ public:
       {
         throw std::runtime_error("Got more encapsulated samples than the encapsulated DSP is prepared to handle!");
       }
-      func(mEncapsulatedInputPointers.GetList(), mEncapsulatedOutputPointers.GetList(), (int)populated1);
+      T** modelInput = PrepareModelInput(populated1);
+      func(modelInput, mEncapsulatedOutputPointers.GetList(), (int)populated1);
       // And push the results into the second resampler so that it has what the external context requires.
-      T** resamplerInput = mEncapsulatedOutputPointers.GetList();
-      if (mAntiAliasEnabled)
-      {
-        ApplyAntiAliasFilter(populated1);
-        resamplerInput = mAntiAliasOutputPointers.GetList();
-      }
+      T** resamplerInput = PrepareDownsamplerInput(populated1);
       if (mUseIntegerDownsampler)
-        DirectDecimateBlock(resamplerInput, populated1, outputs, nFrames);
+        DecimateBlock(resamplerInput, populated1, outputs, nFrames);
       else
         mResampler2->PushBlock(resamplerInput, populated1);
     }
@@ -326,6 +320,10 @@ private:
     memset(mEncapsulatedOutputData.Get(), 0.0f, encapsulatedDataSize);
     memset(mAntiAliasOutputData.Get(), 0.0f, encapsulatedDataSize);
     std::fill(mAntiAliasHistory.begin(), mAntiAliasHistory.end(), T(0.0));
+    std::fill(mAntiImageHistory.begin(), mAntiImageHistory.end(), T(0.0));
+    for (auto& state : mMinimumPhaseAntiImageState)
+      state = {};
+    std::fill(mDecimationFirHistory.begin(), mDecimationFirHistory.end(), T(0.0));
 
     if (mResampler1 != nullptr)
     {
@@ -361,11 +359,25 @@ private:
     mAntiAliasEnabled = mRenderingSampleRate > (mInputSampleRate * 1.000001);
     mAntiAliasCoefficients.clear();
     mAntiAliasHistory.clear();
+    mAntiImageHistory.clear();
     mMinimumPhaseSections.clear();
     mMinimumPhaseState.clear();
+    mMinimumPhaseAntiImageState.clear();
+    mDecimationFirCoefficients.clear();
+    mDecimationFirHistory.clear();
 
     if (!mAntiAliasEnabled)
     {
+      mDesignedFilterPhase = mFilterPhase;
+      return;
+    }
+
+    if (mUseIntegerDownsampler)
+    {
+      if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
+        DesignMinimumPhaseAntiAliasFilter();
+      else
+        DesignDecimationFIRAntiAliasFilter();
       mDesignedFilterPhase = mFilterPhase;
       return;
     }
@@ -406,12 +418,77 @@ private:
     mAntiAliasHistory.assign(NCHANS * (numTaps - 1), T(0.0));
   }
 
+  void DesignDecimationFIRAntiAliasFilter()
+  {
+    constexpr double pi = 3.14159265358979323846264338327950288;
+    constexpr int tapsPerFactor = 192;
+    constexpr double beta = 10.5;
+    constexpr double cutoffScale = 0.4625;
+    const int factor = std::max(1, mIntegerDownsampleFactor);
+    const int numTaps = tapsPerFactor * factor + 1;
+    const double cutoff = cutoffScale / static_cast<double>(factor);
+    const double denom = BesselI0(beta);
+    double sum = 0.0;
+
+    mDecimationFirCoefficients.resize(numTaps);
+    for (int n = 0; n < numTaps; n++)
+    {
+      const double x = n - 0.5 * (numTaps - 1);
+      const double sinc = std::abs(x) < 1.0e-12 ? 2.0 * cutoff : std::sin(2.0 * pi * cutoff * x) / (pi * x);
+      const double r = (2.0 * n) / (numTaps - 1) - 1.0;
+      const double window = BesselI0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / denom;
+      mDecimationFirCoefficients[n] = static_cast<T>(sinc * window);
+      sum += mDecimationFirCoefficients[n];
+    }
+
+    if (std::abs(sum) > 1.0e-20)
+      for (auto& c : mDecimationFirCoefficients)
+        c = static_cast<T>(c / sum);
+
+    mAntiImageHistory.assign(NCHANS * (numTaps - 1), T(0.0));
+    mDecimationFirHistory.assign(NCHANS * (numTaps - 1), T(0.0));
+  }
+
   void ApplyAntiAliasFilter(size_t nFrames)
   {
     if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
       ApplyMinimumPhaseAntiAliasFilter(nFrames);
     else
       ApplyLinearPhaseAntiAliasFilter(nFrames);
+  }
+
+  T** PrepareDownsamplerInput(size_t nFrames)
+  {
+    if (!mAntiAliasEnabled)
+      return mEncapsulatedOutputPointers.GetList();
+
+    if (mUseIntegerDownsampler && mFilterPhase == EAntiAliasFilterPhase::LinearPhase)
+      return mEncapsulatedOutputPointers.GetList();
+
+    ApplyAntiAliasFilter(nFrames);
+    return mAntiAliasOutputPointers.GetList();
+  }
+
+  T** PrepareModelInput(size_t nFrames)
+  {
+    if (!mAntiAliasEnabled)
+      return mEncapsulatedInputPointers.GetList();
+
+    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
+    {
+      ApplyMinimumPhaseFilter(mEncapsulatedInputPointers.GetList(), mAntiAliasOutputPointers.GetList(), nFrames,
+                              mMinimumPhaseAntiImageState);
+      return mAntiAliasOutputPointers.GetList();
+    }
+
+    if (mUseIntegerDownsampler && !mDecimationFirCoefficients.empty())
+    {
+      ApplyFIR(mEncapsulatedInputPointers.GetList(), mAntiAliasOutputPointers.GetList(), nFrames,
+               mDecimationFirCoefficients, mAntiImageHistory);
+      return mAntiAliasOutputPointers.GetList();
+    }
+
+    return mEncapsulatedInputPointers.GetList();
   }
 
   void ApplyLinearPhaseAntiAliasFilter(size_t nFrames)
@@ -464,18 +541,31 @@ private:
     T z2 = T(0.0);
   };
 
-  void DesignMinimumPhaseAntiAliasFilter()
+  static double BesselI0(double x)
+  {
+    double sum = 1.0;
+    double term = 1.0;
+    const double y = 0.25 * x * x;
+    for (int k = 1; k < 32; k++)
+    {
+      term *= y / static_cast<double>(k * k);
+      sum += term;
+      if (term < 1.0e-12 * sum)
+        break;
+    }
+    return sum;
+  }
+
+  std::vector<BiquadCoefficients> DesignButterworthLowpass(double cutoff, int order)
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
-    constexpr int order = 12;
-    constexpr int numSections = order / 2;
-    const double cutoffHz = 0.475 * mInputSampleRate;
-    const double cutoff = std::min(0.49, cutoffHz / mRenderingSampleRate);
+    cutoff = std::min(0.49, std::max(0.001, cutoff));
+    const int numSections = order / 2;
     const double omega = 2.0 * pi * cutoff;
     const double sinOmega = std::sin(omega);
     const double cosOmega = std::cos(omega);
 
-    mMinimumPhaseSections.resize(numSections);
+    std::vector<BiquadCoefficients> sections(numSections);
     for (int section = 0; section < numSections; section++)
     {
       const double q = 1.0 / (2.0 * std::cos((2.0 * section + 1.0) * pi / (2.0 * order)));
@@ -488,32 +578,164 @@ private:
       coeffs.b2 = static_cast<T>((1.0 - cosOmega) * 0.5 / a0);
       coeffs.a1 = static_cast<T>((-2.0 * cosOmega) / a0);
       coeffs.a2 = static_cast<T>((1.0 - alpha) / a0);
+      sections[section] = coeffs;
+    }
+    return sections;
+  }
+
+  void DesignMinimumPhaseAntiAliasFilter()
+  {
+    constexpr double pi = 3.14159265358979323846264338327950288;
+    constexpr int order = 40;
+    constexpr int numSections = order / 2;
+    constexpr double rippleDb = 0.1;
+    constexpr double cutoffScale = 0.4625;
+    const double factor = mRenderingSampleRate / mInputSampleRate;
+    const double cutoff = std::min(0.49, cutoffScale / std::max(1.0, factor));
+    const double epsilon = std::sqrt(std::pow(10.0, rippleDb / 10.0) - 1.0);
+    const double mu = std::asinh(1.0 / epsilon) / static_cast<double>(order);
+    const double warpedCutoff = 2.0 * std::tan(pi * cutoff);
+
+    mMinimumPhaseSections.resize(numSections);
+    for (int section = 0; section < numSections; section++)
+    {
+      const double theta = pi * (2.0 * section + 1.0) / (2.0 * order);
+      const double sigma = -std::sinh(mu) * std::sin(theta) * warpedCutoff;
+      const double omega = std::cosh(mu) * std::cos(theta) * warpedCutoff;
+      const double b = -2.0 * sigma;
+      const double c = sigma * sigma + omega * omega;
+      const double a0 = 4.0 + 2.0 * b + c;
+
+      BiquadCoefficients coeffs;
+      coeffs.b0 = static_cast<T>(c / a0);
+      coeffs.b1 = static_cast<T>((2.0 * c) / a0);
+      coeffs.b2 = static_cast<T>(c / a0);
+      coeffs.a1 = static_cast<T>((-8.0 + 2.0 * c) / a0);
+      coeffs.a2 = static_cast<T>((4.0 - 2.0 * b + c) / a0);
       mMinimumPhaseSections[section] = coeffs;
     }
 
     mMinimumPhaseState.assign(NCHANS * mMinimumPhaseSections.size(), BiquadState {});
+    mMinimumPhaseAntiImageState.assign(NCHANS * mMinimumPhaseSections.size(), BiquadState {});
   }
 
   void ApplyMinimumPhaseAntiAliasFilter(size_t nFrames)
   {
+    ApplyMinimumPhaseFilter(mEncapsulatedOutputPointers.GetList(), mAntiAliasOutputPointers.GetList(), nFrames,
+                            mMinimumPhaseState);
+  }
+
+  void ApplyMinimumPhaseFilter(T** input, T** output, size_t nFrames, std::vector<BiquadState>& state)
+  {
     for (int chan = 0; chan < NCHANS; chan++)
     {
-      T* input = mEncapsulatedOutputPointers.Get(chan);
-      T* output = mAntiAliasOutputPointers.Get(chan);
-
       for (size_t s = 0; s < nFrames; s++)
       {
-        T y = input[s];
+        T y = input[chan][s];
         for (size_t section = 0; section < mMinimumPhaseSections.size(); section++)
         {
           const auto& coeffs = mMinimumPhaseSections[section];
-          auto& state = mMinimumPhaseState[chan * mMinimumPhaseSections.size() + section];
-          const T out = coeffs.b0 * y + state.z1;
-          state.z1 = coeffs.b1 * y - coeffs.a1 * out + state.z2;
-          state.z2 = coeffs.b2 * y - coeffs.a2 * out;
+          auto& sectionState = state[chan * mMinimumPhaseSections.size() + section];
+          const T out = coeffs.b0 * y + sectionState.z1;
+          sectionState.z1 = coeffs.b1 * y - coeffs.a1 * out + sectionState.z2;
+          sectionState.z2 = coeffs.b2 * y - coeffs.a2 * out;
           y = out;
         }
-        output[s] = y;
+        output[chan][s] = y;
+      }
+    }
+  }
+
+  void ApplyFIR(T** input, T** output, size_t nFrames, const std::vector<T>& coefficients, std::vector<T>& historyBuffer)
+  {
+    const size_t numTaps = coefficients.size();
+    const size_t historyLen = numTaps - 1;
+
+    for (int chan = 0; chan < NCHANS; chan++)
+    {
+      T* history = historyBuffer.data() + chan * historyLen;
+
+      for (size_t s = 0; s < nFrames; s++)
+      {
+        T y = T(0.0);
+        for (size_t k = 0; k < numTaps; k++)
+        {
+          const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
+          const T x = inputIndex >= 0 ? input[chan][inputIndex] : history[historyLen + inputIndex];
+          y += coefficients[k] * x;
+        }
+        output[chan][s] = y;
+      }
+
+      if (nFrames >= historyLen)
+      {
+        std::copy(input[chan] + nFrames - historyLen, input[chan] + nFrames, history);
+      }
+      else
+      {
+        std::move(history + nFrames, history + historyLen, history);
+        std::copy(input[chan], input[chan] + nFrames, history + historyLen - nFrames);
+      }
+    }
+  }
+
+  int GetDecimationFirLatency() const
+  {
+    if (mDecimationFirCoefficients.empty() || mIntegerDownsampleFactor <= 1)
+      return 0;
+    return static_cast<int>((mDecimationFirCoefficients.size() - 1) / (2 * mIntegerDownsampleFactor));
+  }
+
+  void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
+  {
+    if (!mDecimationFirCoefficients.empty())
+      DirectFIRDecimateBlock(input, nFrames, outputs, maxOutputFrames);
+    else
+      DirectDecimateBlock(input, nFrames, outputs, maxOutputFrames);
+  }
+
+  void DirectFIRDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
+  {
+    const size_t numTaps = mDecimationFirCoefficients.size();
+    const size_t historyLen = numTaps - 1;
+
+    for (size_t s = 0; s < nFrames; s++)
+    {
+      if (mDecimationPhase == 0)
+      {
+        if (outputs != nullptr && mOutputWritePos < static_cast<size_t>(maxOutputFrames))
+        {
+          for (int chan = 0; chan < NCHANS; chan++)
+          {
+            T y = T(0.0);
+            T* history = mDecimationFirHistory.data() + chan * historyLen;
+            for (size_t k = 0; k < numTaps; k++)
+            {
+              const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
+              const T x = inputIndex >= 0 ? input[chan][inputIndex] : history[historyLen + inputIndex];
+              y += mDecimationFirCoefficients[k] * x;
+            }
+            outputs[chan][mOutputWritePos] = y;
+          }
+          mOutputWritePos++;
+        }
+      }
+      mDecimationPhase++;
+      if (mDecimationPhase >= mIntegerDownsampleFactor)
+        mDecimationPhase = 0;
+    }
+
+    for (int chan = 0; chan < NCHANS; chan++)
+    {
+      T* history = mDecimationFirHistory.data() + chan * historyLen;
+      if (nFrames >= historyLen)
+      {
+        std::copy(input[chan] + nFrames - historyLen, input[chan] + nFrames, history);
+      }
+      else
+      {
+        std::move(history + nFrames, history + historyLen, history);
+        std::copy(input[chan], input[chan] + nFrames, history + historyLen - nFrames);
       }
     }
   }
@@ -549,8 +771,12 @@ private:
   WDL_PtrList<T> mAntiAliasOutputPointers;
   std::vector<T> mAntiAliasCoefficients;
   std::vector<T> mAntiAliasHistory;
+  std::vector<T> mAntiImageHistory;
   std::vector<BiquadCoefficients> mMinimumPhaseSections;
   std::vector<BiquadState> mMinimumPhaseState;
+  std::vector<BiquadState> mMinimumPhaseAntiImageState;
+  std::vector<T> mDecimationFirCoefficients;
+  std::vector<T> mDecimationFirHistory;
   bool mAntiAliasEnabled = false;
   EAntiAliasFilterPhase mFilterPhase = EAntiAliasFilterPhase::LinearPhase;
   EAntiAliasFilterPhase mDesignedFilterPhase = EAntiAliasFilterPhase::LinearPhase;
