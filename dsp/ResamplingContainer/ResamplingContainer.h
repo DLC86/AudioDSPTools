@@ -97,7 +97,7 @@ class ResamplingContainer
 {
 public:
   using BlockProcessFunc = std::function<void(T**, T**, int)>;
-  using LanczosResampler = LanczosResampler<T, NCHANS, A>;
+  using LanczosResamplerType = LanczosResampler<T, NCHANS, A>;
 
   // :param renderingSampleRate: The sample rate required by the code to be encapsulated.
   // :param bandwidthSampleRate: The maximum useful sample rate of the encapsulated DSP. This limits the reconstruction
@@ -122,7 +122,7 @@ public:
   // :param inputSampleRate: The external sample rate interacting with this object.
   // :param blockSize: The largest block size that will be given to this class to process until Reset()  is called
   //     again.
-  void Reset(double inputSampleRate, int blockSize = DEFAULT_BLOCK_SIZE)
+  void Reset(double inputSampleRate, int blockSize)
   {
     if (mInputSampleRate == inputSampleRate && mMaxBlockSize == blockSize && mDesignedFilterPhase == mFilterPhase)
     {
@@ -161,9 +161,9 @@ public:
 
     DesignAntiAliasFilter();
 
-    mResampler1 = std::make_unique<LanczosResampler>(mInputSampleRate, mRenderingSampleRate);
+    mResampler1 = std::make_unique<LanczosResamplerType>(mInputSampleRate, mRenderingSampleRate);
     mResampler2 = mUseIntegerDownsampler ? nullptr
-                                         : std::make_unique<LanczosResampler>(mRenderingSampleRate, mInputSampleRate);
+                                         : std::make_unique<LanczosResamplerType>(mRenderingSampleRate, mInputSampleRate);
 
     // Zeroes the scratch pointers so that we warm up with silence.
     ClearBuffers();
@@ -949,7 +949,7 @@ private:
   // The highest sample rate whose bandwidth should be preserved by reconstruction filters.
   const double mBandwidthSampleRate;
   // Pair of resamplers for (1) external -> encapsulated, (2) encapsulated -> external
-  std::unique_ptr<LanczosResampler> mResampler1, mResampler2;
+  std::unique_ptr<LanczosResamplerType> mResampler1, mResampler2;
 };
 
 }; // namespace dsp

@@ -125,6 +125,7 @@ template <typename T = double, int NCHANS = 2, size_t A = 12>
 class LanczosResampler
 {
 private:
+  static constexpr double kPi = 3.14159265358979323846264338327950288;
 #if AUDIODSPTOOLS_SIMDE
   static_assert(std::is_same<T, float>::value, "LanczosResampler requires T to be float when using SIMD instructions");
   static_assert(false, "SIMD version has not been checked! You need to remove this to use it at your own risk!");
@@ -159,8 +160,7 @@ public:
       if (std::fabs(x) < 1e-7)
         return T(1.0);
 
-      const auto pi = iplug::PI;
-      return T(A * std::sin(pi * x) * std::sin(pi * x / A) / (pi * pi * x * x));
+      return T(A * std::sin(kPi * x) * std::sin(kPi * x / A) / (kPi * kPi * x * x));
     };
 
     if (!sTablesInitialized)
