@@ -48,6 +48,7 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
 #include <functional>
 #include <cmath>
 #include <algorithm>
+#include <complex>
 #include <vector>
 
 // #include "IPlugPlatform.h"
@@ -62,8 +63,10 @@ namespace dsp
 
 enum class EAntiAliasFilterPhase
 {
-  MinimumPhase = 0,
-  LinearPhase
+  MinimumPhaseIIR = 0,
+  MinimumPhaseFIR,
+  PolyphaseFIR,
+  LinearPhaseFIR
 };
 
 /** A multi-channel real-time resampling container that can be used to resample
@@ -97,8 +100,13 @@ public:
   using LanczosResampler = LanczosResampler<T, NCHANS, A>;
 
   // :param renderingSampleRate: The sample rate required by the code to be encapsulated.
-  ResamplingContainer(double renderingSampleRate, EAntiAliasFilterPhase filterPhase = EAntiAliasFilterPhase::LinearPhase)
+  // :param bandwidthSampleRate: The maximum useful sample rate of the encapsulated DSP. This limits the reconstruction
+  // bandwidth when the external context runs at a higher sample rate than the model.
+  ResamplingContainer(double renderingSampleRate,
+                      EAntiAliasFilterPhase filterPhase = EAntiAliasFilterPhase::LinearPhaseFIR,
+                      double bandwidthSampleRate = 0.0)
   : mRenderingSampleRate(renderingSampleRate)
+  , mBandwidthSampleRate(bandwidthSampleRate > 0.0 ? bandwidthSampleRate : renderingSampleRate)
   , mFilterPhase(filterPhase)
   {
   }
@@ -165,9 +173,12 @@ public:
     const auto midSamples =
       mUseIntegerDownsampler ? static_cast<size_t>(mIntegerDownsampleFactor) : mResampler2->GetNumSamplesRequiredFor(1);
     mLatency = int(mResampler1->GetNumSamplesRequiredFor(midSamples));
-    if (mAntiAliasEnabled && mUseIntegerDownsampler && !mDecimationFirCoefficients.empty())
+    if (mAntiAliasEnabled && mUseIntegerDownsampler
+        && (mFilterPhase == EAntiAliasFilterPhase::LinearPhaseFIR
+            || mFilterPhase == EAntiAliasFilterPhase::PolyphaseFIR)
+        && !mDecimationFirCoefficients.empty())
       mLatency += 2 * GetDecimationFirLatency();
-    else if (mAntiAliasEnabled && mFilterPhase == EAntiAliasFilterPhase::LinearPhase)
+    else if (mAntiAliasEnabled && mFilterPhase == EAntiAliasFilterPhase::LinearPhaseFIR)
       mLatency += 64;
     // 1. Push some silence through the first resampler.
     mResampler1->PushBlock(mScratchExternalInputPointers.GetList(), mLatency);
@@ -351,7 +362,8 @@ private:
 
   void DesignAntiAliasFilter()
   {
-    mAntiAliasEnabled = mRenderingSampleRate > (mInputSampleRate * 1.000001);
+    mAntiAliasEnabled = mRenderingSampleRate > (mInputSampleRate * 1.000001)
+                        || mInputSampleRate > (mBandwidthSampleRate * 1.000001);
     mAntiAliasCoefficients.clear();
     mAntiAliasHistory.clear();
     mMinimumPhaseSections.clear();
@@ -367,17 +379,24 @@ private:
 
     if (mUseIntegerDownsampler)
     {
-      if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
+      if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseIIR)
         DesignMinimumPhaseAntiAliasFilter();
       else
-        DesignDecimationFIRAntiAliasFilter();
+        DesignDecimationFIRAntiAliasFilter(mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseFIR);
       mDesignedFilterPhase = mFilterPhase;
       return;
     }
 
-    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
+    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseIIR)
     {
       DesignMinimumPhaseAntiAliasFilter();
+      mDesignedFilterPhase = mFilterPhase;
+      return;
+    }
+
+    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseFIR)
+    {
+      DesignMinimumPhaseFIRAntiAliasFilter();
       mDesignedFilterPhase = mFilterPhase;
       return;
     }
@@ -390,7 +409,8 @@ private:
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
     constexpr int numTaps = 255;
-    const double cutoff = std::min(0.49, 0.475 * mInputSampleRate / mRenderingSampleRate);
+    const double effectiveInputSampleRate = std::min(mInputSampleRate, mBandwidthSampleRate);
+    const double cutoff = std::min(0.49, 0.475 * effectiveInputSampleRate / mRenderingSampleRate);
     double sum = 0.0;
 
     mAntiAliasCoefficients.resize(numTaps);
@@ -411,39 +431,58 @@ private:
     mAntiAliasHistory.assign(NCHANS * (numTaps - 1), T(0.0));
   }
 
-  void DesignDecimationFIRAntiAliasFilter()
+  void DesignMinimumPhaseFIRAntiAliasFilter()
+  {
+    DesignLinearPhaseAntiAliasFilter();
+    ConvertFIRToMinimumPhase(mAntiAliasCoefficients);
+    std::fill(mAntiAliasHistory.begin(), mAntiAliasHistory.end(), T(0.0));
+  }
+
+  std::vector<T> DesignKaiserLowpassFIR(int numTaps, double cutoff)
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
-    constexpr int tapsPerFactor = 128;
     constexpr double beta = 10.5;
-    constexpr double cutoffScale = 0.445;
-    const int factor = std::max(1, mIntegerDownsampleFactor);
-    const int numTaps = tapsPerFactor * factor + 1;
-    const double cutoff = cutoffScale / static_cast<double>(factor);
     const double denom = BesselI0(beta);
     double sum = 0.0;
+    std::vector<T> coefficients(numTaps);
 
-    mDecimationFirCoefficients.resize(numTaps);
     for (int n = 0; n < numTaps; n++)
     {
       const double x = n - 0.5 * (numTaps - 1);
       const double sinc = std::abs(x) < 1.0e-12 ? 2.0 * cutoff : std::sin(2.0 * pi * cutoff * x) / (pi * x);
       const double r = (2.0 * n) / (numTaps - 1) - 1.0;
       const double window = BesselI0(beta * std::sqrt(std::max(0.0, 1.0 - r * r))) / denom;
-      mDecimationFirCoefficients[n] = static_cast<T>(sinc * window);
-      sum += mDecimationFirCoefficients[n];
+      coefficients[n] = static_cast<T>(sinc * window);
+      sum += coefficients[n];
     }
 
     if (std::abs(sum) > 1.0e-20)
-      for (auto& c : mDecimationFirCoefficients)
+      for (auto& c : coefficients)
         c = static_cast<T>(c / sum);
+
+    return coefficients;
+  }
+
+  void DesignDecimationFIRAntiAliasFilter(bool minimumPhase)
+  {
+    constexpr int tapsPerFactor = 128;
+    constexpr double cutoffScale = 0.445;
+    const double effectiveInputSampleRate = std::min(mInputSampleRate, mBandwidthSampleRate);
+    const double effectiveFactor = std::max(1.0, mRenderingSampleRate / effectiveInputSampleRate);
+    const int factor = std::max(1, static_cast<int>(std::ceil(effectiveFactor)));
+    const int numTaps = tapsPerFactor * factor + 1;
+    const double cutoff = std::min(0.49, cutoffScale / effectiveFactor);
+
+    mDecimationFirCoefficients = DesignKaiserLowpassFIR(numTaps, cutoff);
+    if (minimumPhase)
+      ConvertFIRToMinimumPhase(mDecimationFirCoefficients);
 
     mDecimationFirHistory.assign(NCHANS * (numTaps - 1), T(0.0));
   }
 
   void ApplyAntiAliasFilter(size_t nFrames)
   {
-    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhase)
+    if (mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseIIR)
       ApplyMinimumPhaseAntiAliasFilter(nFrames);
     else
       ApplyLinearPhaseAntiAliasFilter(nFrames);
@@ -454,7 +493,9 @@ private:
     if (!mAntiAliasEnabled)
       return mEncapsulatedOutputPointers.GetList();
 
-    if (mUseIntegerDownsampler && mFilterPhase == EAntiAliasFilterPhase::LinearPhase)
+    if (mUseIntegerDownsampler && (mFilterPhase == EAntiAliasFilterPhase::PolyphaseFIR
+                                   || mFilterPhase == EAntiAliasFilterPhase::LinearPhaseFIR
+                                   || mFilterPhase == EAntiAliasFilterPhase::MinimumPhaseFIR))
       return mEncapsulatedOutputPointers.GetList();
 
     ApplyAntiAliasFilter(nFrames);
@@ -526,6 +567,83 @@ private:
     return sum;
   }
 
+  static void FFT(std::vector<std::complex<double>>& data, bool inverse)
+  {
+    const size_t n = data.size();
+    for (size_t i = 1, j = 0; i < n; i++)
+    {
+      size_t bit = n >> 1;
+      for (; j & bit; bit >>= 1)
+        j ^= bit;
+      j ^= bit;
+      if (i < j)
+        std::swap(data[i], data[j]);
+    }
+
+    constexpr double pi = 3.14159265358979323846264338327950288;
+    for (size_t len = 2; len <= n; len <<= 1)
+    {
+      const double angle = (inverse ? 2.0 : -2.0) * pi / static_cast<double>(len);
+      const std::complex<double> wLen(std::cos(angle), std::sin(angle));
+      for (size_t i = 0; i < n; i += len)
+      {
+        std::complex<double> w(1.0, 0.0);
+        for (size_t j = 0; j < len / 2; j++)
+        {
+          const auto u = data[i + j];
+          const auto v = data[i + j + len / 2] * w;
+          data[i + j] = u + v;
+          data[i + j + len / 2] = u - v;
+          w *= wLen;
+        }
+      }
+    }
+
+    if (inverse)
+      for (auto& x : data)
+        x /= static_cast<double>(n);
+  }
+
+  void ConvertFIRToMinimumPhase(std::vector<T>& coefficients)
+  {
+    const size_t numTaps = coefficients.size();
+    size_t fftSize = 1;
+    while (fftSize < 16 * numTaps)
+      fftSize <<= 1;
+
+    std::vector<std::complex<double>> spectrum(fftSize, {});
+    for (size_t i = 0; i < numTaps; i++)
+      spectrum[i] = static_cast<double>(coefficients[i]);
+
+    FFT(spectrum, false);
+    for (auto& x : spectrum)
+      x = std::log(std::max(1.0e-14, std::abs(x)));
+
+    FFT(spectrum, true);
+    std::vector<std::complex<double>> minimumCepstrum(fftSize, {});
+    minimumCepstrum[0] = spectrum[0].real();
+    for (size_t i = 1; i < fftSize / 2; i++)
+      minimumCepstrum[i] = 2.0 * spectrum[i].real();
+    if ((fftSize & 1U) == 0U)
+      minimumCepstrum[fftSize / 2] = spectrum[fftSize / 2].real();
+
+    FFT(minimumCepstrum, false);
+    for (auto& x : minimumCepstrum)
+      x = std::exp(x);
+
+    FFT(minimumCepstrum, true);
+    double sum = 0.0;
+    for (size_t i = 0; i < numTaps; i++)
+    {
+      coefficients[i] = static_cast<T>(minimumCepstrum[i].real());
+      sum += coefficients[i];
+    }
+
+    if (std::abs(sum) > 1.0e-20)
+      for (auto& c : coefficients)
+        c = static_cast<T>(c / sum);
+  }
+
   std::vector<BiquadCoefficients> DesignButterworthLowpass(double cutoff, int order)
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
@@ -560,7 +678,8 @@ private:
     constexpr int numSections = order / 2;
     constexpr double rippleDb = 0.1;
     constexpr double cutoffScale = 0.445;
-    const double factor = mRenderingSampleRate / mInputSampleRate;
+    const double effectiveInputSampleRate = std::min(mInputSampleRate, mBandwidthSampleRate);
+    const double factor = mRenderingSampleRate / effectiveInputSampleRate;
     const double cutoff = std::min(0.49, cutoffScale / std::max(1.0, factor));
     const double epsilon = std::sqrt(std::pow(10.0, rippleDb / 10.0) - 1.0);
     const double mu = std::asinh(1.0 / epsilon) / static_cast<double>(order);
@@ -666,7 +785,12 @@ private:
   void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   {
     if (!mDecimationFirCoefficients.empty())
-      DirectFIRDecimateBlock(input, nFrames, outputs, maxOutputFrames);
+    {
+      if (mFilterPhase == EAntiAliasFilterPhase::PolyphaseFIR)
+        DirectPolyphaseFIRDecimateBlock(input, nFrames, outputs, maxOutputFrames);
+      else
+        DirectFIRDecimateBlock(input, nFrames, outputs, maxOutputFrames);
+    }
     else
       DirectDecimateBlock(input, nFrames, outputs, maxOutputFrames);
   }
@@ -691,6 +815,56 @@ private:
               const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
               const T x = inputIndex >= 0 ? input[chan][inputIndex] : history[historyLen + inputIndex];
               y += mDecimationFirCoefficients[k] * x;
+            }
+            outputs[chan][mOutputWritePos] = y;
+          }
+          mOutputWritePos++;
+        }
+      }
+      mDecimationPhase++;
+      if (mDecimationPhase >= mIntegerDownsampleFactor)
+        mDecimationPhase = 0;
+    }
+
+    for (int chan = 0; chan < NCHANS; chan++)
+    {
+      T* history = mDecimationFirHistory.data() + chan * historyLen;
+      if (nFrames >= historyLen)
+      {
+        std::copy(input[chan] + nFrames - historyLen, input[chan] + nFrames, history);
+      }
+      else
+      {
+        std::move(history + nFrames, history + historyLen, history);
+        std::copy(input[chan], input[chan] + nFrames, history + historyLen - nFrames);
+      }
+    }
+  }
+
+  void DirectPolyphaseFIRDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
+  {
+    const int factor = std::max(1, mIntegerDownsampleFactor);
+    const size_t numTaps = mDecimationFirCoefficients.size();
+    const size_t historyLen = numTaps - 1;
+
+    for (size_t s = 0; s < nFrames; s++)
+    {
+      if (mDecimationPhase == 0)
+      {
+        if (outputs != nullptr && mOutputWritePos < static_cast<size_t>(maxOutputFrames))
+        {
+          for (int chan = 0; chan < NCHANS; chan++)
+          {
+            T y = T(0.0);
+            T* history = mDecimationFirHistory.data() + chan * historyLen;
+            for (int phase = 0; phase < factor; phase++)
+            {
+              for (size_t k = static_cast<size_t>(phase); k < numTaps; k += static_cast<size_t>(factor))
+              {
+                const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
+                const T x = inputIndex >= 0 ? input[chan][inputIndex] : history[historyLen + inputIndex];
+                y += mDecimationFirCoefficients[k] * x;
+              }
             }
             outputs[chan][mOutputWritePos] = y;
           }
@@ -753,8 +927,8 @@ private:
   std::vector<T> mDecimationFirCoefficients;
   std::vector<T> mDecimationFirHistory;
   bool mAntiAliasEnabled = false;
-  EAntiAliasFilterPhase mFilterPhase = EAntiAliasFilterPhase::LinearPhase;
-  EAntiAliasFilterPhase mDesignedFilterPhase = EAntiAliasFilterPhase::LinearPhase;
+  EAntiAliasFilterPhase mFilterPhase = EAntiAliasFilterPhase::LinearPhaseFIR;
+  EAntiAliasFilterPhase mDesignedFilterPhase = EAntiAliasFilterPhase::LinearPhaseFIR;
   bool mUseIntegerDownsampler = false;
   int mIntegerDownsampleFactor = 1;
   int mDecimationPhase = 0;
@@ -772,6 +946,8 @@ private:
   int mLatency = 0;
   // The sample rate required by the DSP that this object encapsulates
   const double mRenderingSampleRate;
+  // The highest sample rate whose bandwidth should be preserved by reconstruction filters.
+  const double mBandwidthSampleRate;
   // Pair of resamplers for (1) external -> encapsulated, (2) encapsulated -> external
   std::unique_ptr<LanczosResampler> mResampler1, mResampler2;
 };
