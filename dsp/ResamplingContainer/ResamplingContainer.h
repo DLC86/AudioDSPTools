@@ -611,7 +611,7 @@ private:
     while (fftSize < 16 * numTaps)
       fftSize <<= 1;
 
-    std::vector<std::complex<double>> spectrum(fftSize, {});
+    std::vector<std::complex<double>> spectrum(fftSize, std::complex<double>{0.0, 0.0});
     for (size_t i = 0; i < numTaps; i++)
       spectrum[i] = static_cast<double>(coefficients[i]);
 
@@ -620,7 +620,7 @@ private:
       x = std::log(std::max(1.0e-14, std::abs(x)));
 
     FFT(spectrum, true);
-    std::vector<std::complex<double>> minimumCepstrum(fftSize, {});
+    std::vector<std::complex<double>> minimumCepstrum(fftSize, std::complex<double>{0.0, 0.0});
     minimumCepstrum[0] = spectrum[0].real();
     for (size_t i = 1; i < fftSize / 2; i++)
       minimumCepstrum[i] = 2.0 * spectrum[i].real();
