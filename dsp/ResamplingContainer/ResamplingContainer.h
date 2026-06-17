@@ -50,6 +50,13 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
 #include <algorithm>
 #include <complex>
 #include <vector>
+#include <chrono>
+#include <mutex>
+#include <sstream>
+#include <fstream>
+#include <atomic>
+#include <array>
+#include <cstdlib>
 
 // #include "IPlugPlatform.h"
 
@@ -142,6 +149,14 @@ void Reset(double inputSampleRate, int blockSize)
     mUseCascadedHalfBandResampler =
       UsesCascadedFIR() && mUseIntegerDownsampler && IsPowerOfTwo(mIntegerDownsampleFactor);
 
+    // Realtime Minimum Phase path: IIR half-band upsample, NAM at high rate,
+    // then true-polyphase IIR half-band decimation by default.
+    //
+    // Set NAM_MINPHASE_IIR_CLEAN_FUSED=1 to use the previous verified
+    // CLEAN_FUSED Butterworth fallback for A/B regression testing.
+    mUseRealtimeIIRHalfBand = mUseCascadedHalfBandResampler && UsesMinimumPhaseCascadedFIR();
+
+
     mDecimationPhase = 0;
 
     mMaxBlockSize = blockSize;
@@ -228,15 +243,21 @@ void Reset(double inputSampleRate, int blockSize)
    * @param func The function that processes the audio sample at the higher sampling rate. NOTE: std::function can call
    * malloc if you pass in captures */
   
-void ProcessBlock(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
+  void ProcessBlock(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
   {
+    if (mUseRealtimeIIRHalfBand)
+    {
+      ProcessBlockRealtimeIIRHalfBand(inputs, outputs, nFrames, func);
+      return;
+    }
+
     if (mUseCascadedHalfBandResampler)
     {
       ProcessBlockLinearCascadedFIR(inputs, outputs, nFrames, func);
       return;
     }
 
-    mResampler1->PushBlock(inputs, nFrames);
+    mResampler1->PushBlock(PrepareUpsamplerInput(inputs, static_cast<size_t>(nFrames)), nFrames);
     mOutputWritePos = 0;
 
     // This is the most samples the encapsulated context might get. Sometimes it will get fewer.
@@ -285,9 +306,50 @@ void ProcessBlock(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
       mResampler2->RenormalizePhases();
   }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   int GetLatency() const { return mLatency; }
 
 private:
+  struct OnePoleAllpassState
+  {
+    // This is actually a 2-sample all-pass section state. The name is kept
+    // to avoid touching all existing member declarations.
+    T x1 = T(0.0);
+    T x2 = T(0.0);
+    T y1 = T(0.0);
+    T y2 = T(0.0);
+  };
+
+  static constexpr int kIIRHalfBandSections = 6;
+
+
+
   static inline int LinearInterpolate(T** inputs, T** outputs, int inputLen, double ratio, int maxOutputLen)
   {
     // FIXME check through this!
@@ -363,9 +425,18 @@ void ClearBuffers()
 
     std::fill(mAntiAliasHistory.begin(), mAntiAliasHistory.end(), T(0.0));
     std::fill(mDecimationFirHistory.begin(), mDecimationFirHistory.end(), T(0.0));
+    std::fill(mUpsamplingInputFilterHistory.begin(), mUpsamplingInputFilterHistory.end(), T(0.0));
+    std::fill(mUpsamplingInputIIRState.begin(), mUpsamplingInputIIRState.end(), BiquadState {});
+    std::fill(mMinPhaseDownIIRState.begin(), mMinPhaseDownIIRState.end(), BiquadState {});
+    std::fill(mMinPhaseDownIIRPhase.begin(), mMinPhaseDownIIRPhase.end(), 0);
     std::fill(mCascadedHalfBandHistory.begin(), mCascadedHalfBandHistory.end(), T(0.0));
     std::fill(mCascadedHalfBandPhase.begin(), mCascadedHalfBandPhase.end(), 0);
     std::fill(mCascadedHalfBandInterpHistory.begin(), mCascadedHalfBandInterpHistory.end(), T(0.0));
+
+    std::fill(mIIRInterpAState.begin(), mIIRInterpAState.end(), OnePoleAllpassState {});
+    std::fill(mIIRInterpBState.begin(), mIIRInterpBState.end(), OnePoleAllpassState {});
+    std::fill(mIIRPolyDecimEvenState.begin(), mIIRPolyDecimEvenState.end(), OnePoleAllpassState {});
+    std::fill(mIIRPolyDecimOddState.begin(), mIIRPolyDecimOddState.end(), OnePoleAllpassState {});
 
     if (mResampler1 != nullptr)
     {
@@ -414,6 +485,8 @@ void DesignAntiAliasFilter()
     mMinimumPhaseState.clear();
     mDecimationFirCoefficients.clear();
     mDecimationFirHistory.clear();
+    mUpsamplingInputFilterCoefficients.clear();
+    mUpsamplingInputFilterHistory.clear();
     mHalfBandCoefficients.clear();
     mCascadedHalfBandHistory.clear();
     mCascadedHalfBandPhase.clear();
@@ -440,6 +513,10 @@ void DesignAntiAliasFilter()
       DesignMinimumPhaseAntiAliasFilter();
     else
       DesignLinearPhaseAntiAliasFilter();
+
+    DesignUpsamplingInputAntiImageFilter();
+    if (UsesMinimumPhaseCascadedFIR())
+      DesignMinimumPhaseIIRDownsampleFilter();
 
     mDesignedFilterPhase = mFilterPhase;
   }
@@ -528,6 +605,208 @@ void DesignAntiAliasFilter()
   }
 
   
+
+  double GetStrictUpsamplingInputGuardCutoff() const
+  {
+    if (mInputSampleRate <= 0.0)
+      return 0.49;
+
+    // Same strict bandwidth idea as the down/up reconstruction filters:
+    // host >= model -> model bandwidth
+    // host <  model -> host bandwidth
+    //
+    // 0.42 * Fs gives ~20.16 kHz at 48 kHz, preserving the intended audible
+    // passband while leaving real transition room before Nyquist.
+    const double bandwidthBasis = GetStrictBandwidthBasisSampleRate();
+    const double cutoffHz = 0.42 * bandwidthBasis;
+
+    return std::min(0.49, std::max(0.001, cutoffHz / mInputSampleRate));
+  }
+
+  void DesignUpsamplingInputAntiImageFilter()
+  {
+    mUpsamplingInputFilterCoefficients.clear();
+    mUpsamplingInputFilterHistory.clear();
+    mUpsamplingInputIIRSections.clear();
+    mUpsamplingInputIIRState.clear();
+
+    if (mInputSampleRate <= 0.0)
+      return;
+
+    if (UsesMinimumPhaseCascadedFIR())
+    {
+      // Minimum Phase pre-upsample IIR.
+      // Runs at external/pre-upsample sample rate.
+      int order = 16;
+      double cutoffScale = 0.475;
+
+      if (const char* envOrder = std::getenv("NAM_MINPHASE_PRE_IIR_ORDER"))
+      {
+        const int parsed = std::atoi(envOrder);
+        if (parsed >= 2)
+          order = parsed;
+      }
+
+      if (order < 2)
+        order = 2;
+      if (order > 64)
+        order = 64;
+      if ((order & 1) != 0)
+        order++;
+
+      if (const char* envCutoff = std::getenv("NAM_MINPHASE_PRE_IIR_CUTOFF_SCALE"))
+      {
+        const double parsed = std::atof(envCutoff);
+        if (parsed > 0.01 && parsed < 0.499)
+          cutoffScale = parsed;
+      }
+
+      const double bandwidthBasis = GetStrictBandwidthBasisSampleRate();
+      const double cutoffHz = cutoffScale * bandwidthBasis;
+      const double cutoff = std::min(0.49, std::max(0.001, cutoffHz / mInputSampleRate));
+
+      mUpsamplingInputIIRSections = DesignButterworthLowpass(cutoff, order);
+      mUpsamplingInputIIRState.assign(static_cast<size_t>(NCHANS) * mUpsamplingInputIIRSections.size(), BiquadState {});
+      return;
+    }
+
+    // Linear Phase short/long: keep the FIR guard.
+    constexpr int numTaps = 513;
+    const double cutoff = GetStrictUpsamplingInputGuardCutoff();
+
+    mUpsamplingInputFilterCoefficients = DesignKaiserLowpassFIR(numTaps, cutoff);
+    ConvertFIRToMinimumPhase(mUpsamplingInputFilterCoefficients);
+    mUpsamplingInputFilterHistory.assign(static_cast<size_t>(NCHANS) * (numTaps - 1), T(0.0));
+  }
+
+
+
+
+
+  T** PrepareUpsamplerInput(T** inputs, size_t nFrames)
+  {
+    if (!mUpsamplingInputIIRSections.empty())
+    {
+      const size_t numSections = mUpsamplingInputIIRSections.size();
+
+      if (mUpsamplingInputIIRState.size() < static_cast<size_t>(NCHANS) * numSections)
+        mUpsamplingInputIIRState.assign(static_cast<size_t>(NCHANS) * numSections, BiquadState {});
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        T* input = inputs[chan];
+        T* output = mScratchExternalInputPointers.Get(chan);
+
+        for (size_t s = 0; s < nFrames; s++)
+        {
+          T y = input[s];
+
+          for (size_t section = 0; section < numSections; section++)
+          {
+            const auto& coeffs = mUpsamplingInputIIRSections[section];
+            auto& state = mUpsamplingInputIIRState[static_cast<size_t>(chan) * numSections + section];
+
+            const T out = coeffs.b0 * y + state.z1;
+            state.z1 = coeffs.b1 * y - coeffs.a1 * out + state.z2;
+            state.z2 = coeffs.b2 * y - coeffs.a2 * out;
+            y = out;
+
+            if (!std::isfinite(static_cast<double>(y)) || std::abs(static_cast<double>(y)) > 1.0e12)
+            {
+              for (size_t resetSection = 0; resetSection < numSections; resetSection++)
+                mUpsamplingInputIIRState[static_cast<size_t>(chan) * numSections + resetSection] = {};
+              y = T(0.0);
+              break;
+            }
+          }
+
+          output[s] = y;
+        }
+      }
+
+      return mScratchExternalInputPointers.GetList();
+    }
+
+    if (mUpsamplingInputFilterCoefficients.empty())
+      return inputs;
+
+    const size_t numTaps = mUpsamplingInputFilterCoefficients.size();
+    const size_t historyLen = numTaps - 1;
+
+    if (mUpsamplingInputFilterHistory.size() < static_cast<size_t>(NCHANS) * historyLen)
+      mUpsamplingInputFilterHistory.assign(static_cast<size_t>(NCHANS) * historyLen, T(0.0));
+
+    for (int chan = 0; chan < NCHANS; chan++)
+    {
+      T* input = inputs[chan];
+      T* output = mScratchExternalInputPointers.Get(chan);
+      T* history = mUpsamplingInputFilterHistory.data() + static_cast<size_t>(chan) * historyLen;
+
+      for (size_t s = 0; s < nFrames; s++)
+      {
+        T y = T(0.0);
+
+        for (size_t k = 0; k < numTaps; k++)
+        {
+          const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
+          const T x = inputIndex >= 0 ? input[static_cast<size_t>(inputIndex)]
+                                      : history[historyLen + static_cast<size_t>(inputIndex)];
+          y += mUpsamplingInputFilterCoefficients[k] * x;
+        }
+
+        output[s] = y;
+      }
+
+      if (nFrames >= historyLen)
+      {
+        std::copy(input + nFrames - historyLen, input + nFrames, history);
+      }
+      else
+      {
+        std::move(history + nFrames, history + historyLen, history);
+        std::copy(input, input + nFrames, history + historyLen - nFrames);
+      }
+    }
+
+    return mScratchExternalInputPointers.GetList();
+  }
+
+  
+  void DesignMinimumPhaseIIRDownsampleFilter()
+  {
+    mMinPhaseDownIIRSections.clear();
+    mMinPhaseDownIIRState.clear();
+    mMinPhaseDownIIRPhase.clear();
+
+    if (mInputSampleRate <= 0.0 || mRenderingSampleRate <= 0.0)
+      return;
+
+    int order = 16;
+    const double cutoff = GetCascadedPrototypeCutoff();
+
+    if (const char* envOrder = std::getenv("NAM_MINPHASE_DOWN_IIR_ORDER"))
+    {
+      const int parsed = std::atoi(envOrder);
+      if (parsed >= 2)
+        order = parsed;
+    }
+
+    if (order < 2)
+      order = 2;
+    if (order > 64)
+      order = 64;
+    if ((order & 1) != 0)
+      order++;
+
+    mMinPhaseDownIIRSections = DesignButterworthLowpass(cutoff, order);
+
+    const size_t stages = static_cast<size_t>(std::max(0, mCascadedHalfBandStages));
+    const size_t states = stages * static_cast<size_t>(NCHANS) * mMinPhaseDownIIRSections.size();
+
+    mMinPhaseDownIIRState.assign(states, BiquadState {});
+    mMinPhaseDownIIRPhase.assign(stages, 0);
+  }
+
 T** PrepareDownsamplerInput(size_t nFrames)
   {
     if (!mAntiAliasEnabled)
@@ -539,6 +818,8 @@ T** PrepareDownsamplerInput(size_t nFrames)
     ApplyAntiAliasFilter(nFrames);
     return mAntiAliasOutputPointers.GetList();
   }
+
+
 
   void ApplyLinearPhaseAntiAliasFilter(size_t nFrames)
   {
@@ -968,6 +1249,22 @@ int GetCascadedPrototypeNumTaps() const
   // END NAM_OS_THREE_STRICT_BANDWIDTH_MODES
 
   
+  void BuildHalfBandPolyphaseTapCache()
+  {
+    for (size_t parity = 0; parity < 2; parity++)
+    {
+      mHalfBandPolyphaseTapIndices[parity].clear();
+      mHalfBandPolyphaseTapCoefficients[parity].clear();
+    }
+
+    for (size_t k = 0; k < mHalfBandCoefficients.size(); k++)
+    {
+      const size_t parity = k & 1U;
+      mHalfBandPolyphaseTapIndices[parity].push_back(k);
+      mHalfBandPolyphaseTapCoefficients[parity].push_back(mHalfBandCoefficients[k]);
+    }
+  }
+
 void DesignCascadedHalfBandAntiAliasFilter()
   {
     mCascadedHalfBandStages = 0;
@@ -981,6 +1278,7 @@ void DesignCascadedHalfBandAntiAliasFilter()
     }
 
     SelectCascadedFIRCoefficients();
+    BuildHalfBandPolyphaseTapCache();
 
     if (mCascadedHalfBandStages <= 0 || mHalfBandCoefficients.empty())
       return;
@@ -1002,6 +1300,14 @@ void DesignCascadedHalfBandAntiAliasFilter()
       T(0.0));
 
     mCascadedHalfBandInterpBuffers.resize(static_cast<size_t>(mCascadedHalfBandStages));
+    mIIRHalfBandBuffers.resize(static_cast<size_t>(mCascadedHalfBandStages));
+    EnsureIIRHalfBandState();
+
+    // Critical anti-image guard before upsampling:
+    // keep ultrasonic/images out of the NAM model input. Without this, the
+    // non-linear model can fold/intermodulate upsampling images back into
+    // audible band, which then survives even a correct downsampler.
+    DesignUpsamplingInputAntiImageFilter();
   }
 
   
@@ -1049,52 +1355,97 @@ int GetCascadedHalfBandRoundTripLatency() const
 
   size_t HalfBandInterpolateBy2Stage(int stage, T** input, size_t nFrames, T** output, size_t maxOutputFrames)
   {
-    const size_t numTaps = mHalfBandCoefficients.size();
-    const size_t historyLen = numTaps - 1;
+    // Exact FIR/polyphase interpolation by 2 with cached tap lists and
+    // prefix/steady-state split.
+    //
+    // First historyLen output samples may read the previous block history.
+    // After that, every tap reads the current input block, so the hot loop has
+    // no per-tap history branch. Coefficients/cutoff/phase are unchanged.
+    const size_t historyLen = mHalfBandCoefficients.size() - 1;
     const size_t stageHistoryOffset = static_cast<size_t>(stage) * NCHANS * historyLen;
     const size_t outputFrames = std::min(maxOutputFrames, nFrames * 2);
+    const size_t steadyStart = std::min(outputFrames, historyLen);
 
     for (int chan = 0; chan < NCHANS; chan++)
     {
       T* history = mCascadedHalfBandInterpHistory.data() + stageHistoryOffset + chan * historyLen;
+      T* in = input[chan];
+      T* out = output[chan];
 
-      for (size_t os = 0; os < outputFrames; os++)
+      // Prefix: preserve exact increasing-k accumulation order while handling history.
+      for (size_t os = 0; os < steadyStart; os++)
       {
         T y = T(0.0);
 
-        for (size_t k = 0; k < numTaps; k++)
+        const size_t parity = os & 1U;
+        const auto& tapIndices = mHalfBandPolyphaseTapIndices[parity];
+        const auto& tapCoeffs = mHalfBandPolyphaseTapCoefficients[parity];
+
+        size_t ti = 0;
+        const size_t n = tapIndices.size();
+
+        // k <= os reads current input.
+        for (; ti < n; ti++)
         {
-          const T coeff = mHalfBandCoefficients[k];
+          const size_t k = tapIndices[ti];
+          if (k > os)
+            break;
 
-          if (coeff == T(0.0))
-            continue;
-
-          const long zIndex = static_cast<long>(os) - static_cast<long>(k);
-          T x = T(0.0);
-
-          if (zIndex >= 0)
-          {
-            if ((zIndex & 1L) == 0L)
-              x = input[chan][static_cast<size_t>(zIndex >> 1)];
-          }
-          else
-          {
-            x = history[historyLen + zIndex];
-          }
-
-          y += coeff * x;
+          y += tapCoeffs[ti] * in[(os - k) >> 1];
         }
 
-        // Zero-stuffing by 2 halves the DC gain, so compensate by 2.
-        output[chan][os] = T(2.0) * y;
+        // k > os reads zero-stuffed history.
+        for (; ti < n; ti++)
+        {
+          const size_t k = tapIndices[ti];
+          const long zIndex = static_cast<long>(os) - static_cast<long>(k);
+          y += tapCoeffs[ti] * history[historyLen + zIndex];
+        }
+
+        out[os] = T(2.0) * y;
       }
 
+      // Steady state: all tap reads are in the current input block.
+      for (size_t os = steadyStart; os < outputFrames; os++)
+      {
+        T y = T(0.0);
+
+        const size_t parity = os & 1U;
+        const auto& tapIndices = mHalfBandPolyphaseTapIndices[parity];
+        const auto& tapCoeffs = mHalfBandPolyphaseTapCoefficients[parity];
+
+        size_t ti = 0;
+        const size_t n = tapIndices.size();
+
+        for (; ti + 3 < n; ti += 4)
+        {
+          const size_t k0 = tapIndices[ti + 0];
+          const size_t k1 = tapIndices[ti + 1];
+          const size_t k2 = tapIndices[ti + 2];
+          const size_t k3 = tapIndices[ti + 3];
+
+          y += tapCoeffs[ti + 0] * in[(os - k0) >> 1];
+          y += tapCoeffs[ti + 1] * in[(os - k1) >> 1];
+          y += tapCoeffs[ti + 2] * in[(os - k2) >> 1];
+          y += tapCoeffs[ti + 3] * in[(os - k3) >> 1];
+        }
+
+        for (; ti < n; ti++)
+        {
+          const size_t k = tapIndices[ti];
+          y += tapCoeffs[ti] * in[(os - k) >> 1];
+        }
+
+        out[os] = T(2.0) * y;
+      }
+
+      // Keep the same zero-stuffed history representation as the legacy path.
       if (outputFrames >= historyLen)
       {
         for (size_t i = 0; i < historyLen; i++)
         {
           const size_t zIndex = outputFrames - historyLen + i;
-          history[i] = ((zIndex & 1U) == 0U) ? input[chan][zIndex >> 1] : T(0.0);
+          history[i] = ((zIndex & 1U) == 0U) ? in[zIndex >> 1] : T(0.0);
         }
       }
       else
@@ -1105,7 +1456,7 @@ int GetCascadedHalfBandRoundTripLatency() const
         {
           const size_t zIndex = i;
           history[historyLen - outputFrames + i] =
-            ((zIndex & 1U) == 0U) ? input[chan][zIndex >> 1] : T(0.0);
+            ((zIndex & 1U) == 0U) ? in[zIndex >> 1] : T(0.0);
         }
       }
     }
@@ -1113,12 +1464,16 @@ int GetCascadedHalfBandRoundTripLatency() const
     return outputFrames;
   }
 
+
+
+
+
   size_t CascadedHalfBandUpsampleBlock(T** input, size_t nFrames, T** output, size_t maxOutputFrames)
   {
     T** stageInput = input;
     size_t stageInputFrames = nFrames;
 
-    std::vector<T*> previousStagePointers;
+    std::vector<T*> previousStagePointers(static_cast<size_t>(NCHANS));
 
     for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
     {
@@ -1131,7 +1486,9 @@ int GetCascadedHalfBandRoundTripLatency() const
       }
 
       auto& buffer = mCascadedHalfBandInterpBuffers[static_cast<size_t>(stage)];
-      buffer.assign(NCHANS * maxStageOutputFrames, T(0.0));
+      const size_t requiredBufferSize = static_cast<size_t>(NCHANS) * maxStageOutputFrames;
+      if (buffer.size() < requiredBufferSize)
+        buffer.resize(requiredBufferSize);
 
       std::vector<T*> stageOutputPointers(static_cast<size_t>(NCHANS));
 
@@ -1149,32 +1506,402 @@ int GetCascadedHalfBandRoundTripLatency() const
     return 0;
   }
 
-  void ProcessBlockLinearCascadedFIR(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
+
+
+
+
+
+
+
+
+
+
+  size_t IIRStateIndex(int stage, int chan, int section) const
   {
-    if (mCascadedHalfBandStages <= 0 || mHalfBandCoefficients.empty())
+    return (static_cast<size_t>(stage) * NCHANS + static_cast<size_t>(chan)) * kIIRHalfBandSections
+           + static_cast<size_t>(section);
+  }
+
+
+  static T ProcessOnePoleAllpass(T x, T a, OnePoleAllpassState& s)
+  {
+    // HIIR-style first-order all-pass section:
+    //
+    //   H(z) = (a + z^-1) / (1 + a z^-1)
+    //
+    // Difference equation:
+    //
+    //   y[n] = a*x[n] + x[n-1] - a*y[n-1]
+    //
+    // The coefficient table used by IIRHalfBandCoeffA/B is a first-order
+    // all-pass half-band table. Treating these coefficients as second-order
+    // sections breaks the half-band response and makes Minimum Phase behave
+    // like a bad/near-1x anti-alias path.
+    const T y = a * x + s.x1 - a * s.y1;
+
+    s.x1 = x;
+    s.y1 = y;
+
+    return y;
+  }
+
+  static T IIRHalfBandCoeffA(int i)
+  {
+    static constexpr double coeffs[kIIRHalfBandSections] = {
+      0.036681502163648017,
+      0.2746317593794541,
+      0.56109896978791948,
+      0.769741833862266,
+      0.8922608180038789,
+      0.962094548378084
+    };
+    return static_cast<T>(coeffs[i]);
+  }
+  static T IIRHalfBandCoeffB(int i)
+  {
+    static constexpr double coeffs[kIIRHalfBandSections] = {
+      0.13654762463195771,
+      0.42313861743656667,
+      0.6775400499741616,
+      0.839889624849638,
+      0.9315419599631839,
+      0.9878163707328971
+    };
+    return static_cast<T>(coeffs[i]);
+  }
+
+
+  void EnsureIIRHalfBandState()
+  {
+    const size_t stateCount = static_cast<size_t>(std::max(0, mCascadedHalfBandStages)) * NCHANS * kIIRHalfBandSections;
+
+    mIIRInterpAState.assign(stateCount, OnePoleAllpassState {});
+    mIIRInterpBState.assign(stateCount, OnePoleAllpassState {});
+  }
+
+
+
+  bool UseMinimumPhaseIIRCleanFusedFallback() const
+  {
+    // TRUE_POLYPHASE is now the default Minimum Phase downsampler.
+    //
+    // Set NAM_MINPHASE_IIR_CLEAN_FUSED=1 only for A/B regression testing
+    // against the previous verified fused Butterworth IIR decimator.
+    const char* v = std::getenv("NAM_MINPHASE_IIR_CLEAN_FUSED");
+    return v != nullptr && v[0] != '\0' && v[0] != '0' && v[0] != 'f' && v[0] != 'F'
+           && v[0] != 'n' && v[0] != 'N';
+  }
+
+  void EnsureIIRPolyphaseDecimatorState()
+  {
+    const size_t stateCount = static_cast<size_t>(std::max(0, mCascadedHalfBandStages)) * NCHANS * kIIRHalfBandSections;
+
+    mIIRPolyDecimEvenState.assign(stateCount, OnePoleAllpassState {});
+    mIIRPolyDecimOddState.assign(stateCount, OnePoleAllpassState {});
+  }
+
+  T ProcessIIRHalfBandPolyphaseDecimEvenBranch(int stage, int chan, T x)
+  {
+    // Correct low-pass analysis orientation:
+    //   even input phase -> B all-pass branch
+    //   odd  input phase -> A all-pass branch
+    T y = x;
+    for (int i = 0; i < kIIRHalfBandSections; i++)
+      y = ProcessOnePoleAllpass(y, IIRHalfBandCoeffB(i), mIIRPolyDecimEvenState[IIRStateIndex(stage, chan, i)]);
+
+    return y;
+  }
+
+  T ProcessIIRHalfBandPolyphaseDecimOddBranch(int stage, int chan, T x)
+  {
+    T y = x;
+    for (int i = 0; i < kIIRHalfBandSections; i++)
+      y = ProcessOnePoleAllpass(y, IIRHalfBandCoeffA(i), mIIRPolyDecimOddState[IIRStateIndex(stage, chan, i)]);
+
+    return y;
+  }
+
+  T ProcessIIRHalfBandInterpBranchA(int stage, int chan, T x)
+  {
+    T y = x;
+    for (int i = 0; i < kIIRHalfBandSections; i++)
+      y = ProcessOnePoleAllpass(y, IIRHalfBandCoeffA(i), mIIRInterpAState[IIRStateIndex(stage, chan, i)]);
+
+    return y;
+  }
+
+  T ProcessIIRHalfBandInterpBranchB(int stage, int chan, T x)
+  {
+    T y = x;
+    for (int i = 0; i < kIIRHalfBandSections; i++)
+      y = ProcessOnePoleAllpass(y, IIRHalfBandCoeffB(i), mIIRInterpBState[IIRStateIndex(stage, chan, i)]);
+
+    return y;
+  }
+  size_t IIRHalfBandUpsampleBy2Stage(int stage, T** input, size_t nFrames, T** output, size_t maxOutputFrames)
+  {
+    // Correct all-pass/polyphase interpolation:
+    //   y[2n]   = A(input[n])
+    //   y[2n+1] = B(input[n])
+    //
+    // The previous implementation drove a recursive all-pass network with
+    // zero-stuffed high-rate samples. That is not the polyphase form and it
+    // badly changes the passband/stopband behavior.
+    const size_t outputFrames = std::min(maxOutputFrames, nFrames * 2);
+
+    for (int chan = 0; chan < NCHANS; chan++)
     {
-      throw std::runtime_error("Cascaded FIR resampler is active but was not designed.");
+      for (size_t n = 0; n < nFrames; n++)
+      {
+        const size_t evenIndex = n * 2;
+        const size_t oddIndex = evenIndex + 1;
+
+        const T x = input[chan][n];
+        const T even = ProcessIIRHalfBandInterpBranchA(stage, chan, x);
+        const T odd = ProcessIIRHalfBandInterpBranchB(stage, chan, x);
+
+        if (evenIndex < outputFrames)
+          output[chan][evenIndex] = even;
+        if (oddIndex < outputFrames)
+          output[chan][oddIndex] = odd;
+      }
     }
+
+    return outputFrames;
+  }
+
+
+
+  size_t CascadedIIRHalfBandUpsampleBlock(T** input, size_t nFrames, T** output, size_t maxOutputFrames)
+  {
+    T** stageInput = input;
+    size_t stageInputFrames = nFrames;
+    std::array<T*, NCHANS> previousStagePointers {};
+
+    for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
+    {
+      const bool finalStage = stage == (mCascadedHalfBandStages - 1);
+      const size_t maxStageOutputFrames = finalStage ? maxOutputFrames : stageInputFrames * 2;
+
+      if (finalStage)
+        return IIRHalfBandUpsampleBy2Stage(stage, stageInput, stageInputFrames, output, maxStageOutputFrames);
+
+      auto& buffer = mIIRHalfBandBuffers[static_cast<size_t>(stage)];
+      const size_t requiredBufferSize = static_cast<size_t>(NCHANS) * maxStageOutputFrames;
+      if (buffer.size() < requiredBufferSize)
+        buffer.resize(requiredBufferSize);
+
+      std::array<T*, NCHANS> stageOutputPointers {};
+      for (int chan = 0; chan < NCHANS; chan++)
+        stageOutputPointers[static_cast<size_t>(chan)] =
+          buffer.data() + static_cast<size_t>(chan) * maxStageOutputFrames;
+
+      const size_t produced = IIRHalfBandUpsampleBy2Stage(
+        stage, stageInput, stageInputFrames, stageOutputPointers.data(), maxStageOutputFrames);
+
+      previousStagePointers = stageOutputPointers;
+      stageInput = previousStagePointers.data();
+      stageInputFrames = produced;
+    }
+
+    return 0;
+  }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  void ProcessBlockRealtimeIIRHalfBand(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
+  {
+    const bool profile =
+      []()
+      {
+        const char* v = std::getenv("NAM_RESAMPLER_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0' && v[0] != 'f' && v[0] != 'F'
+               && v[0] != 'n' && v[0] != 'N';
+      }();
+
+    const bool cleanFusedFallback = UseMinimumPhaseIIRCleanFusedFallback();
+    const bool truePolyphase = !cleanFusedFallback;
+    const char* modeLabel =
+      truePolyphase ? "MinimumPhaseIIR_TRUE_POLYPHASE" : "MinimumPhaseIIR_CLEAN_FUSED_FALLBACK";
+
+    using ProfileClock = std::chrono::high_resolution_clock;
+    const auto t0 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
+    if (mIIRInterpAState.empty() || mIIRInterpBState.empty())
+      EnsureIIRHalfBandState();
+
+    if (truePolyphase && (mIIRPolyDecimEvenState.empty() || mIIRPolyDecimOddState.empty()))
+      EnsureIIRPolyphaseDecimatorState();
+
+    if (mUpsamplingInputIIRSections.empty())
+      DesignUpsamplingInputAntiImageFilter();
 
     mOutputWritePos = 0;
 
+    const auto tUp0 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
     const size_t upsampledFrames =
-      CascadedHalfBandUpsampleBlock(inputs, static_cast<size_t>(nFrames),
+      CascadedIIRHalfBandUpsampleBlock(PrepareUpsamplerInput(inputs, static_cast<size_t>(nFrames)),
+                                       static_cast<size_t>(nFrames),
+                                       mEncapsulatedInputPointers.GetList(),
+                                       static_cast<size_t>(mMaxEncapsulatedBlockSize));
+
+    const auto tUp1 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
+    if (upsampledFrames > static_cast<size_t>(mMaxEncapsulatedBlockSize))
+      throw std::runtime_error("Realtime IIR upsampler produced more samples than the model buffer can hold.");
+
+    const auto tModel0 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
+    func(mEncapsulatedInputPointers.GetList(),
+         mEncapsulatedOutputPointers.GetList(),
+         static_cast<int>(upsampledFrames));
+
+    const auto tModel1 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+    const auto tDown0 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
+    if (truePolyphase)
+      CascadedMinimumPhaseIIRTruePolyphaseDecimateBlock(mEncapsulatedOutputPointers.GetList(), upsampledFrames, outputs, nFrames);
+    else
+      CascadedMinimumPhaseIIRFusedDecimateBlock(mEncapsulatedOutputPointers.GetList(), upsampledFrames, outputs, nFrames);
+
+    const auto tDown1 = profile ? ProfileClock::now() : ProfileClock::time_point {};
+
+    const auto populated = mOutputWritePos;
+    if (populated < static_cast<size_t>(nFrames))
+    {
+      for (int c = 0; c < NCHANS; c++)
+      {
+        const T lastSample = populated > 0 ? outputs[c][populated - 1] : T(0.0);
+        for (int i = static_cast<int>(populated); i < nFrames; i++)
+          outputs[c][i] = lastSample;
+      }
+    }
+
+    if (profile)
+    {
+      const auto t1 = ProfileClock::now();
+
+      auto ms = [](ProfileClock::time_point a, ProfileClock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+      };
+
+      static std::atomic<unsigned long long> sProfileBlocks {0};
+      static std::mutex sProfileMutex;
+      static double sTotalMs = 0.0;
+      static double sUpMs = 0.0;
+      static double sModelMs = 0.0;
+      static double sDownMs = 0.0;
+
+      const double upMs = ms(tUp0, tUp1);
+      const double modelMs = ms(tModel0, tModel1);
+      const double downMs = ms(tDown0, tDown1);
+      const double totalMs = ms(t0, t1);
+      const auto blocks = sProfileBlocks.fetch_add(1) + 1;
+
+      {
+        std::lock_guard<std::mutex> lock(sProfileMutex);
+
+        sTotalMs += totalMs;
+        sUpMs += upMs;
+        sModelMs += modelMs;
+        sDownMs += downMs;
+
+        if (blocks == 1 || (blocks % 128ULL) == 0ULL)
+        {
+          const double denom = std::max(1.0, sTotalMs);
+
+          std::ostringstream oss;
+          oss << "[NAM Resampler Profile]"
+              << " mode=" << modeLabel
+              << " blocks=" << blocks
+              << " nFrames=" << nFrames
+              << " upsampledFrames=" << upsampledFrames
+              << " stages=" << mCascadedHalfBandStages
+              << " preIIRSections=" << mUpsamplingInputIIRSections.size()
+              << " total_ms/block=" << (sTotalMs / static_cast<double>(blocks))
+              << " up_ms/block=" << (sUpMs / static_cast<double>(blocks))
+              << " model_ms/block=" << (sModelMs / static_cast<double>(blocks))
+              << " down_ms/block=" << (sDownMs / static_cast<double>(blocks))
+              << " up=" << (100.0 * sUpMs / denom) << "%"
+              << " model=" << (100.0 * sModelMs / denom) << "%"
+              << " down=" << (100.0 * sDownMs / denom) << "%"
+              << "\n";
+
+          std::cerr << oss.str();
+
+          const char* tempDir = std::getenv("TEMP");
+          if (tempDir != nullptr && tempDir[0] != '\0')
+          {
+            std::ofstream f(std::string(tempDir) + "\\NAM-Oversampler-resampler-profile.log", std::ios::app);
+            if (f.is_open())
+              f << oss.str();
+          }
+
+          std::ofstream fLocal("NAM-Oversampler-resampler-profile.log", std::ios::app);
+          if (fLocal.is_open())
+            fLocal << oss.str();
+        }
+      }
+    }
+  }
+
+
+
+
+
+
+  void ProcessBlockLinearCascadedFIR(T** inputs, T** outputs, int nFrames, BlockProcessFunc func)
+  {
+    const bool profile =
+      []()
+      {
+        const char* v = std::getenv("NAM_RESAMPLER_PROFILE");
+        return v != nullptr && v[0] != '\0' && v[0] != '0' && v[0] != 'f' && v[0] != 'F'
+               && v[0] != 'n' && v[0] != 'N';
+      }();
+
+    using ProfileClock = std::chrono::high_resolution_clock;
+    const auto t0 = profile ? ProfileClock::now() : ProfileClock::time_point{};
+
+    mOutputWritePos = 0;
+
+    const auto tUp0 = profile ? ProfileClock::now() : ProfileClock::time_point{};
+
+    const size_t upsampledFrames =
+      CascadedHalfBandUpsampleBlock(PrepareUpsamplerInput(inputs, static_cast<size_t>(nFrames)),
+                                      static_cast<size_t>(nFrames),
                                     mEncapsulatedInputPointers.GetList(),
                                     static_cast<size_t>(mMaxEncapsulatedBlockSize));
 
+    const auto tUp1 = profile ? ProfileClock::now() : ProfileClock::time_point{};
+
     if (upsampledFrames > static_cast<size_t>(mMaxEncapsulatedBlockSize))
-    {
-      throw std::runtime_error("Cascaded half-band upsampler produced more samples than the model buffer can hold!");
-    }
+      throw std::runtime_error("Cascaded half-band upsampler produced more samples than the model buffer can hold.");
+
+    const auto tModel0 = profile ? ProfileClock::now() : ProfileClock::time_point{};
 
     func(mEncapsulatedInputPointers.GetList(), mEncapsulatedOutputPointers.GetList(), static_cast<int>(upsampledFrames));
 
-    T** resamplerInput = PrepareDownsamplerInput(upsampledFrames);
-    DecimateBlock(resamplerInput, upsampledFrames, outputs, nFrames);
+    const auto tModel1 = profile ? ProfileClock::now() : ProfileClock::time_point{};
+    const auto tDown0 = profile ? ProfileClock::now() : ProfileClock::time_point{};
+
+    CascadedHalfBandDecimateBlock(mEncapsulatedOutputPointers.GetList(), upsampledFrames, outputs, nFrames);
+
+    const auto tDown1 = profile ? ProfileClock::now() : ProfileClock::time_point{};
 
     const auto populated = mOutputWritePos;
-
     if (populated < static_cast<size_t>(nFrames))
     {
       std::cerr << "Cascaded half-band path yielded too few samples (" << populated << " / " << nFrames
@@ -1183,65 +1910,166 @@ int GetCascadedHalfBandRoundTripLatency() const
       for (int c = 0; c < NCHANS; c++)
       {
         const T lastSample = populated > 0 ? outputs[c][populated - 1] : T(0.0);
-
         for (int i = static_cast<int>(populated); i < nFrames; i++)
           outputs[c][i] = lastSample;
       }
     }
+
+    if (profile)
+    {
+      const auto t1 = ProfileClock::now();
+
+      static std::atomic<unsigned long long> sBlocks{0};
+      static std::atomic<unsigned long long> sInputFrames{0};
+      static std::atomic<unsigned long long> sUpsampledFrames{0};
+      static std::atomic<unsigned long long> sUpNs{0};
+      static std::atomic<unsigned long long> sModelNs{0};
+      static std::atomic<unsigned long long> sDownNs{0};
+      static std::atomic<unsigned long long> sTotalNs{0};
+
+      const auto nsUp =
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(tUp1 - tUp0).count());
+      const auto nsModel =
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(tModel1 - tModel0).count());
+      const auto nsDown =
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(tDown1 - tDown0).count());
+      const auto nsTotal =
+        static_cast<unsigned long long>(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+
+      sUpNs.fetch_add(nsUp, std::memory_order_relaxed);
+      sModelNs.fetch_add(nsModel, std::memory_order_relaxed);
+      sDownNs.fetch_add(nsDown, std::memory_order_relaxed);
+      sTotalNs.fetch_add(nsTotal, std::memory_order_relaxed);
+      sInputFrames.fetch_add(static_cast<unsigned long long>(std::max(0, nFrames)), std::memory_order_relaxed);
+      sUpsampledFrames.fetch_add(static_cast<unsigned long long>(upsampledFrames), std::memory_order_relaxed);
+      const auto blocks = sBlocks.fetch_add(1, std::memory_order_relaxed) + 1ULL;
+
+      if (blocks == 1ULL || (blocks % 128ULL) == 0ULL)
+      {
+        const double upMs = static_cast<double>(sUpNs.load(std::memory_order_relaxed)) / 1000000.0;
+        const double modelMs = static_cast<double>(sModelNs.load(std::memory_order_relaxed)) / 1000000.0;
+        const double downMs = static_cast<double>(sDownNs.load(std::memory_order_relaxed)) / 1000000.0;
+        const double totalMs = std::max(0.000001, static_cast<double>(sTotalNs.load(std::memory_order_relaxed)) / 1000000.0);
+        const double invBlocks = 1.0 / static_cast<double>(blocks);
+        const auto inFrames = sInputFrames.load(std::memory_order_relaxed);
+        const auto osFrames = sUpsampledFrames.load(std::memory_order_relaxed);
+        const double avgOS = inFrames > 0ULL ? static_cast<double>(osFrames) / static_cast<double>(inFrames) : 0.0;
+
+        std::ostringstream line;
+        line << "[NAM Resampler Profile] blocks=" << blocks
+             << " avgOS=" << avgOS
+             << " total_ms/block=" << (totalMs * invBlocks)
+             << " up=" << (100.0 * upMs / totalMs) << "%"
+             << " model=" << (100.0 * modelMs / totalMs) << "%"
+             << " down=" << (100.0 * downMs / totalMs) << "%"
+             << " other=" << (100.0 * std::max(0.0, totalMs - upMs - modelMs - downMs) / totalMs) << "%"
+             << std::endl;
+
+        std::cerr << line.str();
+
+        const char* tempDir = std::getenv("TEMP");
+        if (tempDir == nullptr || tempDir[0] == '\0')
+          tempDir = std::getenv("TMP");
+
+        static std::mutex sNAMProfileLogMutex;
+        std::lock_guard<std::mutex> lock(sNAMProfileLogMutex);
+
+        if (tempDir != nullptr && tempDir[0] != '\0')
+        {
+          const std::string logPath = std::string(tempDir) + "\\NAM-Oversampler-resampler-profile.log";
+          std::ofstream logFile(logPath, std::ios::app);
+          if (logFile.is_open())
+            logFile << line.str();
+        }
+
+        // Fallback relative to the current working directory. Useful if TEMP/TMP
+        // is unavailable or the host is sandboxing environment variables.
+        std::ofstream localLog("NAM-Oversampler-resampler-profile.log", std::ios::app);
+        if (localLog.is_open())
+          localLog << line.str();
+      }
+    }
   }
+
+
 
   size_t HalfBandDecimateBy2Stage(int stage, T** input, size_t nFrames, T** output, size_t maxOutputFrames,
                                   bool finalStage)
   {
+    // Exact FIR decimation by 2 with prefix/steady-state split.
+    //
+    // The first historyLen emitted positions may read previous block history.
+    // After that, all taps read the current input block and the hot loop is
+    // branch-free. Coefficients/cutoff/phase are unchanged.
     const size_t numTaps = mHalfBandCoefficients.size();
     const size_t historyLen = numTaps - 1;
     const size_t stageHistoryOffset = static_cast<size_t>(stage) * NCHANS * historyLen;
+    const size_t stageIndex = static_cast<size_t>(stage);
 
     size_t localOutputWritePos = 0;
 
-    for (size_t s = 0; s < nFrames; s++)
+    const int startPhase = mCascadedHalfBandPhase[stageIndex] & 1;
+    for (size_t s = static_cast<size_t>(startPhase); s < nFrames; s += 2)
     {
-      if (mCascadedHalfBandPhase[static_cast<size_t>(stage)] == 0)
+      const bool canWrite = output != nullptr
+                            && ((!finalStage && localOutputWritePos < maxOutputFrames)
+                                || (finalStage && mOutputWritePos < static_cast<size_t>(maxOutputFrames)));
+
+      if (canWrite)
       {
-        const bool canWrite = output != nullptr
-                              && ((!finalStage && localOutputWritePos < maxOutputFrames)
-                                  || (finalStage && mOutputWritePos < static_cast<size_t>(maxOutputFrames)));
+        const size_t writePos = finalStage ? mOutputWritePos : localOutputWritePos;
+        const bool steady = s >= historyLen;
 
-        if (canWrite)
+        for (int chan = 0; chan < NCHANS; chan++)
         {
-          const size_t writePos = finalStage ? mOutputWritePos : localOutputWritePos;
+          T y = T(0.0);
+          T* history = mCascadedHalfBandHistory.data() + stageHistoryOffset + chan * historyLen;
+          T* in = input[chan];
 
-          for (int chan = 0; chan < NCHANS; chan++)
+          if (steady)
           {
-            T y = T(0.0);
-            T* history = mCascadedHalfBandHistory.data() + stageHistoryOffset + chan * historyLen;
+            size_t k = 0;
 
-            for (size_t k = 0; k < numTaps; k++)
+            for (; k + 3 < numTaps; k += 4)
             {
-              const T coeff = mHalfBandCoefficients[k];
-              if (coeff == T(0.0))
-                continue;
-
-              const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
-              const T x = inputIndex >= 0 ? input[chan][inputIndex] : history[historyLen + inputIndex];
-              y += coeff * x;
+              y += mHalfBandCoefficients[k + 0] * in[s - (k + 0)];
+              y += mHalfBandCoefficients[k + 1] * in[s - (k + 1)];
+              y += mHalfBandCoefficients[k + 2] * in[s - (k + 2)];
+              y += mHalfBandCoefficients[k + 3] * in[s - (k + 3)];
             }
 
-            output[chan][writePos] = y;
+            for (; k < numTaps; k++)
+              y += mHalfBandCoefficients[k] * in[s - k];
+          }
+          else
+          {
+            const size_t inputTapCount = std::min(numTaps, s + 1);
+
+            for (size_t k = 0; k < inputTapCount; k++)
+              y += mHalfBandCoefficients[k] * in[s - k];
+
+            for (size_t k = inputTapCount; k < numTaps; k++)
+            {
+              const long inputIndex = static_cast<long>(s) - static_cast<long>(k);
+              y += mHalfBandCoefficients[k] * history[historyLen + inputIndex];
+            }
           }
 
-          if (finalStage)
-            mOutputWritePos++;
+          output[chan][writePos] = y;
         }
 
-        if (!finalStage || output == nullptr)
-          localOutputWritePos++;
-        else
-          localOutputWritePos = mOutputWritePos;
+        if (finalStage)
+          mOutputWritePos++;
       }
 
-      mCascadedHalfBandPhase[static_cast<size_t>(stage)] ^= 1;
+      if (!finalStage || output == nullptr)
+        localOutputWritePos++;
+      else
+        localOutputWritePos = mOutputWritePos;
     }
+
+    // Equivalent to toggling once per consumed high-rate input sample.
+    mCascadedHalfBandPhase[stageIndex] = (mCascadedHalfBandPhase[stageIndex] + static_cast<int>(nFrames & 1U)) & 1;
 
     for (int chan = 0; chan < NCHANS; chan++)
     {
@@ -1261,12 +2089,26 @@ int GetCascadedHalfBandRoundTripLatency() const
     return localOutputWritePos;
   }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
   void CascadedHalfBandDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   {
     T** stageInput = input;
     size_t stageInputFrames = nFrames;
 
-    std::vector<T*> previousStagePointers;
+    std::vector<T*> previousStagePointers(static_cast<size_t>(NCHANS));
 
     for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
     {
@@ -1281,7 +2123,9 @@ int GetCascadedHalfBandRoundTripLatency() const
       else
       {
         auto& buffer = mCascadedHalfBandBuffers[static_cast<size_t>(stage)];
-        buffer.assign(NCHANS * maxStageOutputFrames, T(0.0));
+        const size_t requiredBufferSize = static_cast<size_t>(NCHANS) * maxStageOutputFrames;
+        if (buffer.size() < requiredBufferSize)
+          buffer.resize(requiredBufferSize);
 
         std::vector<T*> stageOutputPointers(static_cast<size_t>(NCHANS));
         for (int chan = 0; chan < NCHANS; chan++)
@@ -1321,6 +2165,251 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
       DirectDecimateBlock(input, nFrames, outputs, maxOutputFrames);
     }
   }
+
+  size_t MinimumPhaseIIRTruePolyphaseDecimateBy2Stage(int stage, T** input, size_t nFrames, T** output,
+                                                       size_t maxOutputFrames, bool finalStage)
+  {
+    if (mIIRPolyDecimEvenState.empty() || mIIRPolyDecimOddState.empty())
+      EnsureIIRPolyphaseDecimatorState();
+
+    size_t localOutputWritePos = 0;
+    const size_t pairs = nFrames / 2;
+
+    for (size_t n = 0; n < pairs; n++)
+    {
+      if (finalStage && mOutputWritePos >= static_cast<size_t>(maxOutputFrames))
+        break;
+
+      if (!finalStage && localOutputWritePos >= maxOutputFrames)
+        break;
+
+      const size_t evenIndex = n * 2;
+      const size_t oddIndex = evenIndex + 1;
+      const size_t writePos = finalStage ? mOutputWritePos : localOutputWritePos;
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        const T even = ProcessIIRHalfBandPolyphaseDecimEvenBranch(stage, chan, input[chan][evenIndex]);
+        const T odd = ProcessIIRHalfBandPolyphaseDecimOddBranch(stage, chan, input[chan][oddIndex]);
+
+        output[chan][writePos] = static_cast<T>(0.5) * (even + odd);
+      }
+
+      if (finalStage)
+        mOutputWritePos++;
+      else
+        localOutputWritePos++;
+    }
+
+    return finalStage ? mOutputWritePos : localOutputWritePos;
+  }
+
+  void CascadedMinimumPhaseIIRTruePolyphaseDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
+  {
+    if (mCascadedHalfBandStages <= 0)
+      return;
+
+    if (mIIRPolyDecimEvenState.empty() || mIIRPolyDecimOddState.empty())
+      EnsureIIRPolyphaseDecimatorState();
+
+    if (mIIRHalfBandBuffers.size() < static_cast<size_t>(mCascadedHalfBandStages))
+      mIIRHalfBandBuffers.resize(static_cast<size_t>(mCascadedHalfBandStages));
+
+    T** stageInput = input;
+    size_t stageInputFrames = nFrames;
+    std::array<T*, NCHANS> previousStagePointers {};
+
+    for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
+    {
+      const bool finalStage = stage == (mCascadedHalfBandStages - 1);
+      const size_t maxStageOutputFrames = (stageInputFrames / 2) + 2;
+
+      if (finalStage)
+      {
+        MinimumPhaseIIRTruePolyphaseDecimateBy2Stage(stage,
+                                                     stageInput,
+                                                     stageInputFrames,
+                                                     outputs,
+                                                     static_cast<size_t>(std::max(0, maxOutputFrames)),
+                                                     true);
+      }
+      else
+      {
+        auto& buffer = mIIRHalfBandBuffers[static_cast<size_t>(stage)];
+        const size_t requiredBufferSize = static_cast<size_t>(NCHANS) * maxStageOutputFrames;
+
+        if (buffer.size() < requiredBufferSize)
+          buffer.resize(requiredBufferSize);
+
+        std::array<T*, NCHANS> stageOutputPointers {};
+        for (int chan = 0; chan < NCHANS; chan++)
+          stageOutputPointers[static_cast<size_t>(chan)] =
+            buffer.data() + static_cast<size_t>(chan) * maxStageOutputFrames;
+
+        const size_t produced =
+          MinimumPhaseIIRTruePolyphaseDecimateBy2Stage(stage,
+                                                       stageInput,
+                                                       stageInputFrames,
+                                                       stageOutputPointers.data(),
+                                                       maxStageOutputFrames,
+                                                       false);
+
+        previousStagePointers = stageOutputPointers;
+        stageInput = previousStagePointers.data();
+        stageInputFrames = produced;
+      }
+    }
+  }
+
+  size_t MinimumPhaseIIRFusedDecimateBy2Stage(int stage, T** input, size_t nFrames, T** output,
+                                                   size_t maxOutputFrames, bool finalStage)
+  {
+    // Minimum Phase fused IIR decimator stage.
+    //
+    // This preserves the verified response: every high-rate sample updates the
+    // Butterworth biquad cascade state, but only the selected decimation phase
+    // is written to the next stage/output. Do not replace this with the old
+    // all-pass half-band decimator: that path had the wrong response/aliasing.
+    if (mMinPhaseDownIIRSections.empty())
+      DesignMinimumPhaseIIRDownsampleFilter();
+
+    if (mMinPhaseDownIIRSections.empty())
+      return 0;
+
+    const size_t numSections = mMinPhaseDownIIRSections.size();
+    const size_t stageCount = static_cast<size_t>(std::max(0, mCascadedHalfBandStages));
+    const size_t requiredStateCount = stageCount * static_cast<size_t>(NCHANS) * numSections;
+
+    if (mMinPhaseDownIIRState.size() < requiredStateCount)
+      mMinPhaseDownIIRState.assign(requiredStateCount, BiquadState {});
+
+    if (mMinPhaseDownIIRPhase.size() < stageCount)
+      mMinPhaseDownIIRPhase.assign(stageCount, 0);
+
+    size_t localOutputWritePos = 0;
+    int phase = mMinPhaseDownIIRPhase[static_cast<size_t>(stage)] & 1;
+
+    for (size_t s = 0; s < nFrames; s++)
+    {
+      const bool emit = phase == 0;
+
+      if (emit)
+      {
+        if (finalStage && mOutputWritePos >= static_cast<size_t>(maxOutputFrames))
+          break;
+
+        if (!finalStage && localOutputWritePos >= maxOutputFrames)
+          break;
+      }
+
+      const size_t writePos = finalStage ? mOutputWritePos : localOutputWritePos;
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        T y = input[chan][s];
+
+        const size_t base =
+          (static_cast<size_t>(stage) * static_cast<size_t>(NCHANS) + static_cast<size_t>(chan)) * numSections;
+
+        for (size_t section = 0; section < numSections; section++)
+        {
+          const auto& coeffs = mMinPhaseDownIIRSections[section];
+          auto& state = mMinPhaseDownIIRState[base + section];
+
+          const T out = coeffs.b0 * y + state.z1;
+          state.z1 = coeffs.b1 * y - coeffs.a1 * out + state.z2;
+          state.z2 = coeffs.b2 * y - coeffs.a2 * out;
+          y = out;
+
+          if (!std::isfinite(static_cast<double>(y)) || std::abs(static_cast<double>(y)) > 1.0e12)
+          {
+            for (size_t resetSection = 0; resetSection < numSections; resetSection++)
+              mMinPhaseDownIIRState[base + resetSection] = {};
+            y = T(0.0);
+            break;
+          }
+        }
+
+        if (emit && output != nullptr)
+          output[chan][writePos] = y;
+      }
+
+      if (emit)
+      {
+        if (finalStage)
+          mOutputWritePos++;
+        else
+          localOutputWritePos++;
+      }
+
+      phase ^= 1;
+    }
+
+    mMinPhaseDownIIRPhase[static_cast<size_t>(stage)] = phase;
+
+    return finalStage ? mOutputWritePos : localOutputWritePos;
+  }
+
+  void CascadedMinimumPhaseIIRFusedDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
+  {
+    if (mCascadedHalfBandStages <= 0)
+      return;
+
+    if (mMinPhaseDownIIRSections.empty())
+      DesignMinimumPhaseIIRDownsampleFilter();
+
+    if (mIIRHalfBandBuffers.size() < static_cast<size_t>(mCascadedHalfBandStages))
+      mIIRHalfBandBuffers.resize(static_cast<size_t>(mCascadedHalfBandStages));
+
+    T** stageInput = input;
+    size_t stageInputFrames = nFrames;
+    std::array<T*, NCHANS> previousStagePointers {};
+
+    for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
+    {
+      const bool finalStage = stage == (mCascadedHalfBandStages - 1);
+      const size_t maxStageOutputFrames = (stageInputFrames + 1) / 2 + 2;
+
+      if (finalStage)
+      {
+        MinimumPhaseIIRFusedDecimateBy2Stage(stage,
+                                             stageInput,
+                                             stageInputFrames,
+                                             outputs,
+                                             static_cast<size_t>(std::max(0, maxOutputFrames)),
+                                             true);
+      }
+      else
+      {
+        auto& buffer = mIIRHalfBandBuffers[static_cast<size_t>(stage)];
+        const size_t requiredBufferSize = static_cast<size_t>(NCHANS) * maxStageOutputFrames;
+
+        if (buffer.size() < requiredBufferSize)
+          buffer.resize(requiredBufferSize);
+
+        std::array<T*, NCHANS> stageOutputPointers {};
+        for (int chan = 0; chan < NCHANS; chan++)
+          stageOutputPointers[static_cast<size_t>(chan)] =
+            buffer.data() + static_cast<size_t>(chan) * maxStageOutputFrames;
+
+        const size_t produced =
+          MinimumPhaseIIRFusedDecimateBy2Stage(stage,
+                                               stageInput,
+                                               stageInputFrames,
+                                               stageOutputPointers.data(),
+                                               maxStageOutputFrames,
+                                               false);
+
+        previousStagePointers = stageOutputPointers;
+        stageInput = previousStagePointers.data();
+        stageInputFrames = produced;
+      }
+    }
+  }
+
+
+
+
 
   void DirectFIRDecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   {
@@ -1449,28 +2538,43 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   WDL_PtrList<T> mAntiAliasOutputPointers;
   std::vector<T> mAntiAliasCoefficients;
   std::vector<T> mAntiAliasHistory;
+  std::vector<T> mUpsamplingInputFilterCoefficients;
+  std::vector<T> mUpsamplingInputFilterHistory;
+  std::vector<BiquadCoefficients> mUpsamplingInputIIRSections;
+  std::vector<BiquadState> mUpsamplingInputIIRState;
   std::vector<BiquadCoefficients> mMinimumPhaseSections;
   std::vector<BiquadState> mMinimumPhaseState;
   std::vector<T> mDecimationFirCoefficients;
   std::vector<T> mDecimationFirHistory;
   std::vector<T> mHalfBandCoefficients;
+  std::array<std::vector<size_t>, 2> mHalfBandPolyphaseTapIndices;
+  std::array<std::vector<T>, 2> mHalfBandPolyphaseTapCoefficients;
   std::vector<T> mCascadedHalfBandHistory;
   std::vector<int> mCascadedHalfBandPhase;
   std::vector<std::vector<T>> mCascadedHalfBandBuffers;
   std::vector<T> mCascadedHalfBandInterpHistory;
   std::vector<std::vector<T>> mCascadedHalfBandInterpBuffers;
+  std::vector<std::vector<T>> mIIRHalfBandBuffers;
+  std::vector<OnePoleAllpassState> mIIRInterpAState;
+  std::vector<OnePoleAllpassState> mIIRInterpBState;
+  std::vector<OnePoleAllpassState> mIIRPolyDecimEvenState;
+  std::vector<OnePoleAllpassState> mIIRPolyDecimOddState;
   int mCascadedHalfBandStages = 0;
   bool mAntiAliasEnabled = false;
   EAntiAliasFilterPhase mFilterPhase = EAntiAliasFilterPhase::MinimumPhaseCascadedFIR;
   EAntiAliasFilterPhase mDesignedFilterPhase = EAntiAliasFilterPhase::MinimumPhaseCascadedFIR;
   bool mUseIntegerDownsampler = false;
   bool mUseCascadedHalfBandResampler = false;
+  bool mUseRealtimeIIRHalfBand = false;
   int mIntegerDownsampleFactor = 1;
   int mDecimationPhase = 0;
   size_t mOutputWritePos = 0;
   // Sample rate ratio from external to encapsulated, from encapsulated to external.
   double mRatio1 = 0.0, mRatio2 = 0.0;
   // Sample rate of the external context.
+  std::vector<BiquadCoefficients> mMinPhaseDownIIRSections;
+  std::vector<BiquadState> mMinPhaseDownIIRState;
+  std::vector<int> mMinPhaseDownIIRPhase;
   double mInputSampleRate = 0.0;
   // The size of the largest block the external context may provide. (It might provide something smaller.)
   int mMaxBlockSize = 0;
