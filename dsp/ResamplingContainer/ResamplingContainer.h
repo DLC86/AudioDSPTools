@@ -335,6 +335,12 @@ void Reset(double inputSampleRate, int blockSize)
 
   int GetLatency() const { return mLatency; }
 
+  /** Returns true when ProcessBlock invokes the encapsulated DSP callback exactly
+   * once for each external block. The power-of-two cascaded oversampling paths
+   * have this property; the fractional Lanczos fallback may invoke it multiple
+   * times while draining its streaming resampler. */
+  bool HasSingleProcessCallbackPerBlock() const { return mUseCascadedHalfBandResampler; }
+
 private:
   struct OnePoleAllpassState
   {
