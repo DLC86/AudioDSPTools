@@ -615,10 +615,10 @@ void DesignAntiAliasFilter()
     // host >= model -> model bandwidth
     // host <  model -> host bandwidth
     //
-    // 0.42 * Fs gives ~20.16 kHz at 48 kHz, preserving the intended audible
-    // passband while leaving real transition room before Nyquist.
+    // 0.455 * Fs gives ~21.84 kHz at 48 kHz, keeping the audible band flatter
+    // while still preserving strict model/host bandwidth guarding before Nyquist.
     const double bandwidthBasis = GetStrictBandwidthBasisSampleRate();
-    const double cutoffHz = 0.42 * bandwidthBasis;
+    const double cutoffHz = 0.455 * bandwidthBasis;
 
     return std::min(0.49, std::max(0.001, cutoffHz / mInputSampleRate));
   }
@@ -630,54 +630,27 @@ void DesignAntiAliasFilter()
     mUpsamplingInputIIRSections.clear();
     mUpsamplingInputIIRState.clear();
 
-    if (mInputSampleRate <= 0.0)
-      return;
-
-    if (UsesMinimumPhaseCascadedFIR())
+    // Linear Phase pre-upsample guard remains disabled:
+    // the cascaded FIR up/down stages already provide the required interpolation
+    // and downsample filtering.
+    //
+    // Minimum Phase gets a model-strict pre-upsample IIR guard only when the
+    // host/output sample rate is higher than the model bandwidth basis, e.g.
+    // host 96 kHz with a 48 kHz model. This uses the same cutoff/order policy
+    // as the post-downsample/output model-strict guard.
+    if (UsesMinimumPhaseCascadedFIR() && NeedsMinimumPhaseOutputModelStrictIIRGuard())
     {
-      // Minimum Phase pre-upsample IIR.
-      // Runs at external/pre-upsample sample rate.
-      int order = 16;
-      double cutoffScale = 0.475;
-
-      if (const char* envOrder = std::getenv("NAM_MINPHASE_PRE_IIR_ORDER"))
-      {
-        const int parsed = std::atoi(envOrder);
-        if (parsed >= 2)
-          order = parsed;
-      }
-
-      if (order < 2)
-        order = 2;
-      if (order > 64)
-        order = 64;
-      if ((order & 1) != 0)
-        order++;
-
-      if (const char* envCutoff = std::getenv("NAM_MINPHASE_PRE_IIR_CUTOFF_SCALE"))
-      {
-        const double parsed = std::atof(envCutoff);
-        if (parsed > 0.01 && parsed < 0.499)
-          cutoffScale = parsed;
-      }
-
-      const double bandwidthBasis = GetStrictBandwidthBasisSampleRate();
-      const double cutoffHz = cutoffScale * bandwidthBasis;
-      const double cutoff = std::min(0.49, std::max(0.001, cutoffHz / mInputSampleRate));
+      const int order = GetMinimumPhaseModelStrictIIROrder();
+      const double cutoff = GetMinimumPhaseOutputModelStrictIIRCutoff();
 
       mUpsamplingInputIIRSections = DesignButterworthLowpass(cutoff, order);
-      mUpsamplingInputIIRState.assign(static_cast<size_t>(NCHANS) * mUpsamplingInputIIRSections.size(), BiquadState {});
-      return;
+      mUpsamplingInputIIRState.assign(
+        static_cast<size_t>(NCHANS) * mUpsamplingInputIIRSections.size(), BiquadState {});
     }
 
-    // Linear Phase short/long: keep the FIR guard.
-    constexpr int numTaps = 513;
-    const double cutoff = GetStrictUpsamplingInputGuardCutoff();
-
-    mUpsamplingInputFilterCoefficients = DesignKaiserLowpassFIR(numTaps, cutoff);
-    ConvertFIRToMinimumPhase(mUpsamplingInputFilterCoefficients);
-    mUpsamplingInputFilterHistory.assign(static_cast<size_t>(NCHANS) * (numTaps - 1), T(0.0));
+    return;
   }
+
 
 
 
@@ -805,7 +778,136 @@ void DesignAntiAliasFilter()
 
     mMinPhaseDownIIRState.assign(states, BiquadState {});
     mMinPhaseDownIIRPhase.assign(stages, 0);
+
+    DesignMinimumPhaseOutputModelStrictIIRGuard();
   }
+
+  bool NeedsMinimumPhaseOutputModelStrictIIRGuard() const
+  {
+    const double bandwidthBasis = GetStrictBandwidthBasisSampleRate();
+
+    // Only needed when the host/output sample rate is higher than the model
+    // bandwidth basis. Example: host 96 kHz, model 48 kHz.
+    //
+    // If host == model, the half-band decimator already ends at the same
+    // Nyquist boundary and this extra output guard would only add roll-off.
+    return mInputSampleRate > 0.0 && bandwidthBasis > 0.0 && mInputSampleRate > bandwidthBasis * 1.001;
+  }
+
+  double GetMinimumPhaseOutputModelStrictIIRCutoff() const
+  {
+    const double passband = GetStrictPassbandEdgeHz();
+    const double stopband = GetStrictStopbandStartHz();
+
+    // Tuned for host > model cases, e.g. 96 kHz host / 48 kHz model.
+    //
+    // With the default 40th-order Butterworth output guard, this bias gives:
+    // - effectively unity gain at 20 kHz
+    // - roughly the same attenuation at 24 kHz as Linear Phase (long)
+    //
+    // For a 48 kHz model bandwidth basis:
+    // passband = 20 kHz, stopband = 24 kHz, cutoff ~= 21.69 kHz.
+    double cutoffBias = 0.4224;
+
+    if (const char* envBias = std::getenv("NAM_MINPHASE_OUTPUT_IIR_CUTOFF_BIAS"))
+    {
+      const double parsed = std::atof(envBias);
+      if (parsed >= 0.0 && parsed <= 1.0)
+        cutoffBias = parsed;
+    }
+
+    const double cutoffHz = passband + cutoffBias * std::max(0.0, stopband - passband);
+
+    return std::min(0.49, std::max(0.001, cutoffHz / mInputSampleRate));
+  }
+
+
+  int GetMinimumPhaseModelStrictIIROrder() const
+  {
+    // Shared by the Minimum Phase pre-upsample and post-downsample/output
+    // model-strict guards so both have the same response.
+    //
+    // 40th order keeps 20 kHz essentially flat while matching the Linear Phase
+    // long attenuation around the 24 kHz model Nyquist boundary.
+    int order = 40;
+
+    if (const char* envOrder = std::getenv("NAM_MINPHASE_OUTPUT_IIR_ORDER"))
+    {
+      const int parsed = std::atoi(envOrder);
+      if (parsed >= 2)
+        order = parsed;
+    }
+
+    if (order < 2)
+      order = 2;
+    if (order > 64)
+      order = 64;
+    if ((order & 1) != 0)
+      order++;
+
+    return order;
+  }
+
+  void DesignMinimumPhaseOutputModelStrictIIRGuard()
+  {
+    mMinPhaseOutputStrictIIRSections.clear();
+    mMinPhaseOutputStrictIIRState.clear();
+
+    if (!NeedsMinimumPhaseOutputModelStrictIIRGuard())
+      return;
+
+    const int order = GetMinimumPhaseModelStrictIIROrder();
+    const double cutoff = GetMinimumPhaseOutputModelStrictIIRCutoff();
+
+    mMinPhaseOutputStrictIIRSections = DesignButterworthLowpass(cutoff, order);
+    mMinPhaseOutputStrictIIRState.assign(
+      static_cast<size_t>(NCHANS) * mMinPhaseOutputStrictIIRSections.size(), BiquadState {});
+  }
+
+  T ProcessMinimumPhaseOutputModelStrictIIRGuardSample(int chan, T x)
+  {
+    if (!NeedsMinimumPhaseOutputModelStrictIIRGuard())
+      return x;
+
+    if (mMinPhaseOutputStrictIIRSections.empty())
+      DesignMinimumPhaseOutputModelStrictIIRGuard();
+
+    if (mMinPhaseOutputStrictIIRSections.empty())
+      return x;
+
+    const size_t numSections = mMinPhaseOutputStrictIIRSections.size();
+    const size_t requiredStateCount = static_cast<size_t>(NCHANS) * numSections;
+
+    if (mMinPhaseOutputStrictIIRState.size() < requiredStateCount)
+      mMinPhaseOutputStrictIIRState.assign(requiredStateCount, BiquadState {});
+
+    const size_t base = static_cast<size_t>(chan) * numSections;
+
+    T y = x;
+
+    for (size_t section = 0; section < numSections; section++)
+    {
+      const auto& coeffs = mMinPhaseOutputStrictIIRSections[section];
+      auto& state = mMinPhaseOutputStrictIIRState[base + section];
+
+      const T out = coeffs.b0 * y + state.z1;
+      state.z1 = coeffs.b1 * y - coeffs.a1 * out + state.z2;
+      state.z2 = coeffs.b2 * y - coeffs.a2 * out;
+      y = out;
+
+      if (!std::isfinite(static_cast<double>(y)) || std::abs(static_cast<double>(y)) > 1.0e12)
+      {
+        for (size_t resetSection = 0; resetSection < numSections; resetSection++)
+          mMinPhaseOutputStrictIIRState[base + resetSection] = {};
+
+        y = T(0.0);
+        break;
+      }
+    }
+
+    return y;
+  }
+
 
 T** PrepareDownsamplerInput(size_t nFrames)
   {
@@ -1221,7 +1323,7 @@ bool UsesCascadedFIR() const
 
 int GetCascadedPrototypeNumTaps() const
   {
-    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 511 : 127;
+    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 513 : 129;
   }
 
   void SelectCascadedFIRCoefficients()
@@ -2192,7 +2294,12 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
         const T even = ProcessIIRHalfBandPolyphaseDecimEvenBranch(stage, chan, input[chan][evenIndex]);
         const T odd = ProcessIIRHalfBandPolyphaseDecimOddBranch(stage, chan, input[chan][oddIndex]);
 
-        output[chan][writePos] = static_cast<T>(0.5) * (even + odd);
+        T y = static_cast<T>(0.5) * (even + odd);
+
+        if (finalStage)
+          y = ProcessMinimumPhaseOutputModelStrictIIRGuardSample(chan, y);
+
+        output[chan][writePos] = y;
       }
 
       if (finalStage)
@@ -2573,6 +2680,8 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   double mRatio1 = 0.0, mRatio2 = 0.0;
   // Sample rate of the external context.
   std::vector<BiquadCoefficients> mMinPhaseDownIIRSections;
+  std::vector<BiquadCoefficients> mMinPhaseOutputStrictIIRSections;
+  std::vector<BiquadState> mMinPhaseOutputStrictIIRState;
   std::vector<BiquadState> mMinPhaseDownIIRState;
   std::vector<int> mMinPhaseDownIIRPhase;
   double mInputSampleRate = 0.0;
