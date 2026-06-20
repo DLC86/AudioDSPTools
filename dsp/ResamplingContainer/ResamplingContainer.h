@@ -501,6 +501,10 @@ void DesignAntiAliasFilter()
     mInterpStagePolyphaseTapCoefficients.clear();
     mDecimStageTapIndices.clear();
     mDecimStageTapCoefficients.clear();
+    mInterpStageDenseReversedCoefficients.clear();
+    mDecimStageDenseReversedCoefficients.clear();
+    mInterpStageDenseBuffers.clear();
+    mDecimStageDenseBuffers.clear();
     mInterpStageHistoryOffsets.clear();
     mDecimStageHistoryOffsets.clear();
     mCascadedHalfBandHistory.clear();
@@ -1388,6 +1392,10 @@ int GetCascadedPrototypeNumTaps() const
     mInterpStagePolyphaseTapCoefficients.assign(stageCount, {});
     mDecimStageTapIndices.assign(stageCount, {});
     mDecimStageTapCoefficients.assign(stageCount, {});
+    mInterpStageDenseReversedCoefficients.assign(stageCount, {});
+    mDecimStageDenseReversedCoefficients.assign(stageCount, {});
+    mInterpStageDenseBuffers.assign(stageCount, {});
+    mDecimStageDenseBuffers.assign(stageCount, {});
     mInterpStageHistoryOffsets.assign(stageCount, 0);
     mDecimStageHistoryOffsets.assign(stageCount, 0);
 
@@ -1438,6 +1446,20 @@ int GetCascadedPrototypeNumTaps() const
         mDecimStageTapIndices[stage].push_back(k);
         mDecimStageTapCoefficients[stage].push_back(coeff);
       }
+
+      if (mInterpStagePolyphaseTapIndices[stage][0].size()
+            + mInterpStagePolyphaseTapIndices[stage][1].size()
+          == mInterpStageCoefficients[stage].size())
+      {
+        mInterpStageDenseReversedCoefficients[stage].assign(
+          mInterpStageCoefficients[stage].rbegin(), mInterpStageCoefficients[stage].rend());
+      }
+
+      if (mDecimStageTapIndices[stage].size() == mDecimStageCoefficients[stage].size())
+      {
+        mDecimStageDenseReversedCoefficients[stage].assign(
+          mDecimStageCoefficients[stage].rbegin(), mDecimStageCoefficients[stage].rend());
+      }
     }
 
     mCascadedHalfBandInterpHistory.assign(interpHistorySize, 0.0f);
@@ -1475,6 +1497,7 @@ void DesignCascadedHalfBandAntiAliasFilter()
 
     for (int stage = 0; stage < mCascadedHalfBandStages; stage++)
     {
+      const size_t downsampleStageInput = maxDownsampleStageInput;
       const size_t upsampledFrames =
         static_cast<size_t>(mMaxBlockSize) << static_cast<size_t>(stage + 1);
       const size_t downsampledFrames = (maxDownsampleStageInput / 2) + 2;
@@ -1488,6 +1511,20 @@ void DesignCascadedHalfBandAntiAliasFilter()
       mCascadedHalfBandBuffers[static_cast<size_t>(stage)].assign(decimBufferSize, 0.0f);
       mIIRHalfBandBuffers[static_cast<size_t>(stage)].assign(sharedIIRBufferSize, T(0.0));
       mIIRHalfBandFloatBuffers[static_cast<size_t>(stage)].assign(sharedIIRBufferSize, 0.0f);
+
+      const size_t stageIndex = static_cast<size_t>(stage);
+      if (!mInterpStageDenseReversedCoefficients[stageIndex].empty())
+      {
+        const size_t historyLen = mInterpStageCoefficients[stageIndex].size() - 1;
+        mInterpStageDenseBuffers[stageIndex].assign(
+          static_cast<size_t>(NCHANS) * (historyLen + upsampledFrames), 0.0f);
+      }
+      if (!mDecimStageDenseReversedCoefficients[stageIndex].empty())
+      {
+        const size_t historyLen = mDecimStageCoefficients[stageIndex].size() - 1;
+        mDecimStageDenseBuffers[stageIndex].assign(
+          static_cast<size_t>(NCHANS) * (historyLen + downsampleStageInput), 0.0f);
+      }
     }
 
     EnsureIIRHalfBandState();
@@ -1578,6 +1615,52 @@ int GetCascadedHalfBandRoundTripLatency() const
     const size_t stageHistoryOffset = mInterpStageHistoryOffsets[stageIndex];
     const size_t outputFrames = std::min(maxOutputFrames, nFrames * 2);
     const size_t steadyStart = std::min(outputFrames, historyLen);
+
+    const auto& reversedCoefficients = mInterpStageDenseReversedCoefficients[stageIndex];
+    if (!reversedCoefficients.empty())
+    {
+      auto& denseBuffer = mInterpStageDenseBuffers[stageIndex];
+      const size_t channelStride = denseBuffer.size() / static_cast<size_t>(NCHANS);
+      const size_t numTaps = reversedCoefficients.size();
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        float* history = mCascadedHalfBandInterpHistory.data() + stageHistoryOffset + chan * historyLen;
+        InputSample* in = input[chan];
+        OutputSample* out = output[chan];
+        float* combined = denseBuffer.data() + static_cast<size_t>(chan) * channelStride;
+
+        std::copy(history, history + historyLen, combined);
+        for (size_t os = 0; os < outputFrames; os++)
+          combined[historyLen + os] =
+            ((os & 1U) == 0U) ? static_cast<float>(in[os >> 1]) : 0.0f;
+
+        for (size_t os = 0; os < outputFrames; os++)
+        {
+          const float* samples = combined + os;
+          float y0 = 0.0f;
+          float y1 = 0.0f;
+          float y2 = 0.0f;
+          float y3 = 0.0f;
+          size_t i = 0;
+          for (; i + 3 < numTaps; i += 4)
+          {
+            y0 += reversedCoefficients[i + 0] * samples[i + 0];
+            y1 += reversedCoefficients[i + 1] * samples[i + 1];
+            y2 += reversedCoefficients[i + 2] * samples[i + 2];
+            y3 += reversedCoefficients[i + 3] * samples[i + 3];
+          }
+          float y = (y0 + y1) + (y2 + y3);
+          for (; i < numTaps; i++)
+            y += reversedCoefficients[i] * samples[i];
+          out[os] = static_cast<OutputSample>(2.0f * y);
+        }
+
+        std::copy(combined + outputFrames, combined + outputFrames + historyLen, history);
+      }
+
+      return outputFrames;
+    }
 
     for (int chan = 0; chan < NCHANS; chan++)
     {
@@ -2243,6 +2326,76 @@ int GetCascadedHalfBandRoundTripLatency() const
     size_t localOutputWritePos = 0;
 
     const int startPhase = mCascadedHalfBandPhase[stageIndex] & 1;
+    const auto& reversedCoefficients = mDecimStageDenseReversedCoefficients[stageIndex];
+    if (!reversedCoefficients.empty())
+    {
+      auto& denseBuffer = mDecimStageDenseBuffers[stageIndex];
+      const size_t channelStride = denseBuffer.size() / static_cast<size_t>(NCHANS);
+      const size_t numTaps = reversedCoefficients.size();
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        float* history = mCascadedHalfBandHistory.data() + stageHistoryOffset + chan * historyLen;
+        float* combined = denseBuffer.data() + static_cast<size_t>(chan) * channelStride;
+        std::copy(history, history + historyLen, combined);
+        for (size_t i = 0; i < nFrames; i++)
+          combined[historyLen + i] = static_cast<float>(input[chan][i]);
+      }
+
+      for (size_t s = static_cast<size_t>(startPhase); s < nFrames; s += 2)
+      {
+        const bool canWrite = output != nullptr
+                              && ((!finalStage && localOutputWritePos < maxOutputFrames)
+                                  || (finalStage && mOutputWritePos < static_cast<size_t>(maxOutputFrames)));
+        if (canWrite)
+        {
+          const size_t writePos = finalStage ? mOutputWritePos : localOutputWritePos;
+          for (int chan = 0; chan < NCHANS; chan++)
+          {
+            const float* samples =
+              mDecimStageDenseBuffers[stageIndex].data() + static_cast<size_t>(chan) * channelStride + s;
+            float y0 = 0.0f;
+            float y1 = 0.0f;
+            float y2 = 0.0f;
+            float y3 = 0.0f;
+            size_t i = 0;
+            for (; i + 3 < numTaps; i += 4)
+            {
+              y0 += reversedCoefficients[i + 0] * samples[i + 0];
+              y1 += reversedCoefficients[i + 1] * samples[i + 1];
+              y2 += reversedCoefficients[i + 2] * samples[i + 2];
+              y3 += reversedCoefficients[i + 3] * samples[i + 3];
+            }
+            float y = (y0 + y1) + (y2 + y3);
+            for (; i < numTaps; i++)
+              y += reversedCoefficients[i] * samples[i];
+            output[chan][writePos] = static_cast<OutputSample>(y);
+          }
+
+          if (finalStage)
+            mOutputWritePos++;
+        }
+
+        if (!finalStage || output == nullptr)
+          localOutputWritePos++;
+        else
+          localOutputWritePos = mOutputWritePos;
+      }
+
+      mCascadedHalfBandPhase[stageIndex] =
+        (mCascadedHalfBandPhase[stageIndex] + static_cast<int>(nFrames & 1U)) & 1;
+
+      for (int chan = 0; chan < NCHANS; chan++)
+      {
+        float* history = mCascadedHalfBandHistory.data() + stageHistoryOffset + chan * historyLen;
+        const float* combined =
+          mDecimStageDenseBuffers[stageIndex].data() + static_cast<size_t>(chan) * channelStride;
+        std::copy(combined + nFrames, combined + nFrames + historyLen, history);
+      }
+
+      return localOutputWritePos;
+    }
+
     for (size_t s = static_cast<size_t>(startPhase); s < nFrames; s += 2)
     {
       const bool canWrite = output != nullptr
@@ -2816,6 +2969,10 @@ void DecimateBlock(T** input, size_t nFrames, T** outputs, int maxOutputFrames)
   std::vector<std::array<std::vector<float>, 2>> mInterpStagePolyphaseTapCoefficients;
   std::vector<std::vector<size_t>> mDecimStageTapIndices;
   std::vector<std::vector<float>> mDecimStageTapCoefficients;
+  std::vector<std::vector<float>> mInterpStageDenseReversedCoefficients;
+  std::vector<std::vector<float>> mDecimStageDenseReversedCoefficients;
+  std::vector<std::vector<float>> mInterpStageDenseBuffers;
+  std::vector<std::vector<float>> mDecimStageDenseBuffers;
   std::vector<size_t> mInterpStageHistoryOffsets;
   std::vector<size_t> mDecimStageHistoryOffsets;
   std::vector<float> mCascadedHalfBandHistory;
