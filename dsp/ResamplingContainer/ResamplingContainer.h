@@ -58,6 +58,16 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
 #include <array>
 #include <cstdlib>
 
+#ifndef NAM_DENSE_FIR_EXPLICIT_SIMD
+  #define NAM_DENSE_FIR_EXPLICIT_SIMD 1
+#endif
+
+#if NAM_DENSE_FIR_EXPLICIT_SIMD && (defined(__AVX__) || defined(_M_AVX) || defined(__SSE2__) || defined(_M_X64))
+  #include <immintrin.h>
+#elif NAM_DENSE_FIR_EXPLICIT_SIMD && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  #include <arm_neon.h>
+#endif
+
 // #include "IPlugPlatform.h"
 
 // #include "heapbuf.h"
@@ -67,6 +77,63 @@ iPlug 2 includes the following 3rd party libraries (see each license info):
 
 namespace dsp
 {
+
+static inline float DenseFIRDotProduct(const float* coefficients, const float* samples, size_t count)
+{
+  size_t i = 0;
+
+#if NAM_DENSE_FIR_EXPLICIT_SIMD && (defined(__AVX__) || defined(_M_AVX))
+  __m256 sum = _mm256_setzero_ps();
+  for (; i + 7 < count; i += 8)
+  {
+    const __m256 c = _mm256_loadu_ps(coefficients + i);
+    const __m256 x = _mm256_loadu_ps(samples + i);
+    sum = _mm256_add_ps(sum, _mm256_mul_ps(c, x));
+  }
+  const __m128 low = _mm256_castps256_ps128(sum);
+  const __m128 high = _mm256_extractf128_ps(sum, 1);
+  __m128 reduced = _mm_add_ps(low, high);
+  reduced = _mm_hadd_ps(reduced, reduced);
+  reduced = _mm_hadd_ps(reduced, reduced);
+  float result = _mm_cvtss_f32(reduced);
+#elif NAM_DENSE_FIR_EXPLICIT_SIMD && (defined(__SSE2__) || defined(_M_X64))
+  __m128 sum0 = _mm_setzero_ps();
+  __m128 sum1 = _mm_setzero_ps();
+  for (; i + 7 < count; i += 8)
+  {
+    sum0 = _mm_add_ps(sum0, _mm_mul_ps(_mm_loadu_ps(coefficients + i), _mm_loadu_ps(samples + i)));
+    sum1 =
+      _mm_add_ps(sum1, _mm_mul_ps(_mm_loadu_ps(coefficients + i + 4), _mm_loadu_ps(samples + i + 4)));
+  }
+  __m128 reduced = _mm_add_ps(sum0, sum1);
+  const __m128 high = _mm_movehl_ps(reduced, reduced);
+  reduced = _mm_add_ps(reduced, high);
+  reduced = _mm_add_ss(reduced, _mm_shuffle_ps(reduced, reduced, 0x55));
+  float result = _mm_cvtss_f32(reduced);
+#elif NAM_DENSE_FIR_EXPLICIT_SIMD && (defined(__ARM_NEON) || defined(__ARM_NEON__))
+  float32x4_t sum0 = vdupq_n_f32(0.0f);
+  float32x4_t sum1 = vdupq_n_f32(0.0f);
+  for (; i + 7 < count; i += 8)
+  {
+    sum0 = vmlaq_f32(sum0, vld1q_f32(samples + i), vld1q_f32(coefficients + i));
+    sum1 = vmlaq_f32(sum1, vld1q_f32(samples + i + 4), vld1q_f32(coefficients + i + 4));
+  }
+  const float32x4_t sum = vaddq_f32(sum0, sum1);
+  #if defined(__aarch64__)
+  float result = vaddvq_f32(sum);
+  #else
+  const float32x2_t pair = vadd_f32(vget_low_f32(sum), vget_high_f32(sum));
+  const float32x2_t reduced = vpadd_f32(pair, pair);
+  float result = vget_lane_f32(reduced, 0);
+  #endif
+#else
+  float result = 0.0f;
+#endif
+
+  for (; i < count; i++)
+    result += coefficients[i] * samples[i];
+  return result;
+}
 
 enum class EAntiAliasFilterPhase
 {
@@ -1638,21 +1705,7 @@ int GetCascadedHalfBandRoundTripLatency() const
         for (size_t os = 0; os < outputFrames; os++)
         {
           const float* samples = combined + os;
-          float y0 = 0.0f;
-          float y1 = 0.0f;
-          float y2 = 0.0f;
-          float y3 = 0.0f;
-          size_t i = 0;
-          for (; i + 3 < numTaps; i += 4)
-          {
-            y0 += reversedCoefficients[i + 0] * samples[i + 0];
-            y1 += reversedCoefficients[i + 1] * samples[i + 1];
-            y2 += reversedCoefficients[i + 2] * samples[i + 2];
-            y3 += reversedCoefficients[i + 3] * samples[i + 3];
-          }
-          float y = (y0 + y1) + (y2 + y3);
-          for (; i < numTaps; i++)
-            y += reversedCoefficients[i] * samples[i];
+          const float y = DenseFIRDotProduct(reversedCoefficients.data(), samples, numTaps);
           out[os] = static_cast<OutputSample>(2.0f * y);
         }
 
@@ -2354,21 +2407,7 @@ int GetCascadedHalfBandRoundTripLatency() const
           {
             const float* samples =
               mDecimStageDenseBuffers[stageIndex].data() + static_cast<size_t>(chan) * channelStride + s;
-            float y0 = 0.0f;
-            float y1 = 0.0f;
-            float y2 = 0.0f;
-            float y3 = 0.0f;
-            size_t i = 0;
-            for (; i + 3 < numTaps; i += 4)
-            {
-              y0 += reversedCoefficients[i + 0] * samples[i + 0];
-              y1 += reversedCoefficients[i + 1] * samples[i + 1];
-              y2 += reversedCoefficients[i + 2] * samples[i + 2];
-              y3 += reversedCoefficients[i + 3] * samples[i + 3];
-            }
-            float y = (y0 + y1) + (y2 + y3);
-            for (; i < numTaps; i++)
-              y += reversedCoefficients[i] * samples[i];
+            const float y = DenseFIRDotProduct(reversedCoefficients.data(), samples, numTaps);
             output[chan][writePos] = static_cast<OutputSample>(y);
           }
 
