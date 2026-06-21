@@ -500,6 +500,7 @@ void ClearBuffers()
     std::fill(mUpsamplingInputFilterHistory.begin(), mUpsamplingInputFilterHistory.end(), T(0.0));
     std::fill(mUpsamplingInputIIRState.begin(), mUpsamplingInputIIRState.end(), BiquadState {});
     std::fill(mMinPhaseDownIIRState.begin(), mMinPhaseDownIIRState.end(), BiquadState {});
+    std::fill(mMinPhaseOutputStrictIIRState.begin(), mMinPhaseOutputStrictIIRState.end(), BiquadState {});
     std::fill(mMinPhaseDownIIRPhase.begin(), mMinPhaseDownIIRPhase.end(), 0);
     std::fill(mCascadedHalfBandHistory.begin(), mCascadedHalfBandHistory.end(), 0.0f);
     std::fill(mCascadedHalfBandPhase.begin(), mCascadedHalfBandPhase.end(), 0);
@@ -1415,9 +1416,12 @@ int GetCascadedPrototypeNumTaps() const
   int GetCascadedInnerNumTaps() const
   {
     // Inner stages operate progressively farther above the audible/model
-    // bandwidth. A sparse true half-band filter is sufficient there and avoids
-    // repeating the expensive edge filter at every 2x stage.
-    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 73 : 37;
+    // bandwidth. Choose group delays divisible by 16 (32/64 taps minus one)
+    // so every supported 2x..32x cascade has an exact integer round-trip
+    // latency at the host rate. The former 37/73-tap choices produced
+    // fractional delays at the higher factors that the host PDC could not
+    // represent exactly.
+    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 65 : 33;
   }
 
   static void NormalizeFIRDCGain(std::vector<T>& coefficients)
@@ -1654,7 +1658,7 @@ double GetCascadedHalfBandDecimationLatencySamples() const
     return latencyAtExternalRate;
   }
 
-int GetCascadedHalfBandRoundTripLatency() const
+  int GetCascadedHalfBandRoundTripLatency() const
   {
     if (UsesMinimumPhaseCascadedFIR())
       return 0;
@@ -1662,8 +1666,9 @@ int GetCascadedHalfBandRoundTripLatency() const
     if (mCascadedHalfBandStages <= 0)
       return 0;
 
-    return static_cast<int>(std::ceil(GetCascadedHalfBandInterpolationLatencySamples()
-                                      + GetCascadedHalfBandDecimationLatencySamples()));
+    const double exactLatency =
+      GetCascadedHalfBandInterpolationLatencySamples() + GetCascadedHalfBandDecimationLatencySamples();
+    return static_cast<int>(std::llround(exactLatency));
   }
 
   template <typename InputSample, typename OutputSample>
