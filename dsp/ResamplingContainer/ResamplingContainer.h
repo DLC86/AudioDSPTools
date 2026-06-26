@@ -641,10 +641,10 @@ void DesignAntiAliasFilter()
     std::fill(mAntiAliasHistory.begin(), mAntiAliasHistory.end(), T(0.0));
   }
 
-  std::vector<T> DesignKaiserLowpassFIR(int numTaps, double cutoff)
+  std::vector<T> DesignKaiserLowpassFIR(int numTaps, double cutoff, double beta = 10.5)
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
-    constexpr double beta = 10.5;
+    beta = std::max(0.0, std::min(30.0, beta));
     const double denom = BesselI0(beta);
     double sum = 0.0;
     std::vector<T> coefficients(numTaps);
@@ -1300,11 +1300,11 @@ static bool IsPowerOfTwo(int x)
     return result;
   }
 
-  std::vector<T> DesignHalfBandLowpassFIR(int numTaps)
+  std::vector<T> DesignHalfBandLowpassFIR(int numTaps, double beta = 10.5)
   {
     constexpr double pi = 3.14159265358979323846264338327950288;
     constexpr double cutoff = 0.25; // Half-band cutoff, normalized to the stage sample rate.
-    constexpr double beta = 10.5;   // Kaiser window, roughly high stop-band attenuation.
+    beta = std::max(0.0, std::min(30.0, beta));
     const double denom = BesselI0(beta);
 
     if ((numTaps % 2) == 0)
@@ -1392,37 +1392,77 @@ bool UsesCascadedFIR() const
     return 0.5 * GetStrictBandwidthBasisSampleRate();
   }
 
-  double GetCascadedPrototypeCutoff() const
+  // BEGIN NAM_OS_FINAL_LINEAR_PRESETS_V1
+  // Final production presets selected after testing nonlinear plug-in cascades.
+  // Minimum Phase / True Polyphase does not use these FIR edge settings.
+  bool UsesLinearLongPreset() const
+  {
+    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong;
+  }
+
+  double GetCascadedEdgeCutoff(double cutoffBias) const
   {
     const double passband = GetStrictPassbandEdgeHz();
     const double stopband = GetStrictStopbandStartHz();
+    const double cutoffHz =
+      passband + cutoffBias * std::max(0.0, stopband - passband);
 
-    // Bias the cutoff closer to the stopband than the midpoint. This keeps the
-    // response effectively unity through the intended passband, especially at 20 kHz,
-    // while the long mode still provides strong rejection near the strict Nyquist.
-    const double cutoffHz = passband + 0.75 * std::max(0.0, stopband - passband);
-
-    // The prototype filter is applied in each 2x stage. The final 2x stage runs
-    // at 2 * hostSampleRate, so this is the normalized cutoff for that stage.
     const double finalStageSampleRate = 2.0 * mInputSampleRate;
     return std::min(0.49, std::max(0.001, cutoffHz / finalStageSampleRate));
   }
 
-int GetCascadedPrototypeNumTaps() const
+  double GetCascadedPrototypeCutoff() const
   {
-    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 513 : 129;
+    // Retained for the Minimum Phase compatibility design data. The realtime
+    // True Polyphase path itself remains unchanged.
+    return GetCascadedEdgeCutoff(0.75);
+  }
+
+  double GetLinearUpsampleEdgeCutoff() const
+  {
+    return GetCascadedEdgeCutoff(UsesLinearLongPreset() ? 0.9938 : 0.9500);
+  }
+
+  double GetLinearDownsampleEdgeCutoff() const
+  {
+    return GetCascadedEdgeCutoff(UsesLinearLongPreset() ? 0.9913 : 0.9300);
+  }
+
+  double GetLinearUpsampleKaiserBeta() const
+  {
+    return 6.0;
+  }
+
+  double GetLinearDownsampleKaiserBeta() const
+  {
+    return 6.0;
+  }
+
+  double GetLinearInnerKaiserBeta() const
+  {
+    return 6.0;
+  }
+
+  int GetCascadedPrototypeNumTaps() const
+  {
+    return UsesLinearLongPreset() ? 1025 : 129;
+  }
+
+  int GetLinearUpsampleEdgeNumTaps() const
+  {
+    return UsesLinearLongPreset() ? 1025 : 129;
+  }
+
+  int GetLinearDownsampleEdgeNumTaps() const
+  {
+    return UsesLinearLongPreset() ? 1025 : 129;
   }
 
   int GetCascadedInnerNumTaps() const
   {
-    // Inner stages operate progressively farther above the audible/model
-    // bandwidth. Choose group delays divisible by 16 (32/64 taps minus one)
-    // so every supported 2x..32x cascade has an exact integer round-trip
-    // latency at the host rate. The former 37/73-tap choices produced
-    // fractional delays at the higher factors that the host PDC could not
-    // represent exactly.
-    return mFilterPhase == EAntiAliasFilterPhase::LinearCascadedFIRLong ? 65 : 33;
+    return 33;
   }
+  // END NAM_OS_FINAL_LINEAR_PRESETS_V1
 
   static void NormalizeFIRDCGain(std::vector<T>& coefficients)
   {
@@ -1473,13 +1513,25 @@ int GetCascadedPrototypeNumTaps() const
     if (!UsesLinearPhaseCascadedFIR() || stageCount == 0)
       return;
 
-    std::vector<T> edgeCoefficientsT =
-      DesignKaiserLowpassFIR(GetCascadedPrototypeNumTaps(), GetCascadedPrototypeCutoff());
-    std::vector<T> innerCoefficientsT = DesignHalfBandLowpassFIR(GetCascadedInnerNumTaps());
-    NormalizeFIRDCGain(edgeCoefficientsT);
+    std::vector<T> interpolationEdgeCoefficientsT =
+      DesignKaiserLowpassFIR(GetLinearUpsampleEdgeNumTaps(),
+                             GetLinearUpsampleEdgeCutoff(),
+                             GetLinearUpsampleKaiserBeta());
+    std::vector<T> decimationEdgeCoefficientsT =
+      DesignKaiserLowpassFIR(GetLinearDownsampleEdgeNumTaps(),
+                             GetLinearDownsampleEdgeCutoff(),
+                             GetLinearDownsampleKaiserBeta());
+    std::vector<T> innerCoefficientsT =
+      DesignHalfBandLowpassFIR(GetCascadedInnerNumTaps(), GetLinearInnerKaiserBeta());
+
+    NormalizeFIRDCGain(interpolationEdgeCoefficientsT);
+    NormalizeFIRDCGain(decimationEdgeCoefficientsT);
     NormalizeFIRDCGain(innerCoefficientsT);
 
-    std::vector<float> edgeCoefficients(edgeCoefficientsT.begin(), edgeCoefficientsT.end());
+    std::vector<float> interpolationEdgeCoefficients(
+      interpolationEdgeCoefficientsT.begin(), interpolationEdgeCoefficientsT.end());
+    std::vector<float> decimationEdgeCoefficients(
+      decimationEdgeCoefficientsT.begin(), decimationEdgeCoefficientsT.end());
     std::vector<float> innerCoefficients(innerCoefficientsT.begin(), innerCoefficientsT.end());
 
     size_t interpHistorySize = 0;
@@ -1487,10 +1539,12 @@ int GetCascadedPrototypeNumTaps() const
 
     for (size_t stage = 0; stage < stageCount; stage++)
     {
-      // The strict edge filter is closest to the host rate in both directions:
+      // The independently tuned edge filters are closest to the host rate:
       // first while interpolating, last while decimating.
-      mInterpStageCoefficients[stage] = stage == 0 ? edgeCoefficients : innerCoefficients;
-      mDecimStageCoefficients[stage] = stage + 1 == stageCount ? edgeCoefficients : innerCoefficients;
+      mInterpStageCoefficients[stage] =
+        stage == 0 ? interpolationEdgeCoefficients : innerCoefficients;
+      mDecimStageCoefficients[stage] =
+        stage + 1 == stageCount ? decimationEdgeCoefficients : innerCoefficients;
 
       mInterpStageHistoryOffsets[stage] = interpHistorySize;
       mDecimStageHistoryOffsets[stage] = decimHistorySize;
